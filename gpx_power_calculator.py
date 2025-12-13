@@ -4543,7 +4543,7 @@ with col_u2:
                     "Avg climb P [W]": float(r.get("avg_climb_power_w", 0.0)),
                     "Best 5 km P [W]": float(r.get("best_segment_5km_power_w", 0.0)),
                 })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
 
 # ---------------- Main content for selected ride ----------------
@@ -4598,31 +4598,31 @@ if key and key in st.session_state["results"]:
     with tabs[0]:
         highlight = st.checkbox("Highlight climbs/downhills", value=False)
         fig = plot_profiles(result, highlight_climbs=highlight)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with tabs[1]:
         fig = plot_segments(result)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with tabs[2]:
         fig = plot_distributions(result, max_speed=MAX_SPEED, max_pwr=MAX_PWR)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with tabs[3]:
         fig = plot_sankey(result)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with tabs[4]:
         fig = plot_mechanical(result)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with tabs[5]:
         fig = plot_human(result)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with tabs[6]:
         fig = plot_environment(result)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with tabs[7]:
         c1_map, c2_map, c3_map = st.columns(3)
@@ -4685,7 +4685,7 @@ if key and key in st.session_state["results"]:
                 spacing_km=float(st.session_state["marker_spacing_km"]),
                 segment_mean_mode=SEGMENT_MEAN_MODE
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     with tabs[8]:
         # “Details” (similar to your stats_details)
