@@ -99,6 +99,7 @@ DEFAULT_AMBIENT_RHO, AMBIENT_RHO = 1.225, 1.225
 
 SEGMENT_MEAN_MODE = False  # global/module-level toggle
 
+details_lines = []
 
 @dataclass
 class RiderBikeConfig:
@@ -150,6 +151,8 @@ def utc_to_local_from_gps(dt_utc: datetime, lat: float, lon: float, fallback_tz:
         print(dt_utc)
         return dt_utc
 
+def print(str_):
+    details_lines.append(str(str_))
 
 def time_to_readable(t_days=0, t_hours=0, t_minutes=0, t_seconds=0, no_break=False):
     total_seconds = (
@@ -2097,8 +2100,8 @@ def _detect_directional_segments(
                 "distance_km": dist_km,
                 "elevation_gain_m": elev_gain_h,           # always positive magnitude
                 "average_grade_pct": avg_grade_pct,        # always positive magnitude
-                "start_time": times[start_idx].timestamp() / 60.0,
-                "end_time": times[end_idx].timestamp() / 60.0,
+                "start_time": times[start_idx].timestamp() / 60.0 - times[0].timestamp() / 60.0,
+                "end_time": times[end_idx].timestamp() / 60.0 - times[0].timestamp() / 60.0,
                 "start_distance_km": dists_cum[start_idx],
                 "end_distance_km": dists_cum[end_idx],
             })
@@ -2722,7 +2725,7 @@ def analyze_gpx_file(
               f"avg grade {climb['average_grade_pct']:.1f} %, "
               f"VAM {climb.get('vam_m_per_h', 0.0):.0f} m/h, "
               f"P_avg {climb.get('avg_power_w', 0.0):.0f} W, "
-              f"from {climb['start_time']} to {climb['end_time']}, "
+              f"from {time_to_readable(t_minutes=climb['start_time'])} to {time_to_readable(t_minutes=climb['end_time'])}, "
               f"distance {climb['start_distance_km']:.2f} km to {climb['end_distance_km']:.2f} km")
     print("\n=== Climb Combination ===")
     for i, climb in enumerate(combined_climbs):
@@ -2731,7 +2734,7 @@ def analyze_gpx_file(
               f"avg grade {climb['average_grade_pct']:.1f} %, "
               f"VAM {climb.get('vam_m_per_h', 0.0):.0f} m/h, "
               f"P_avg {climb.get('avg_power_w', 0.0):.0f} W, "
-              f"from {climb['start_time']} to {climb['end_time']}, "
+              f"from {time_to_readable(t_minutes=climb['start_time'])} to {time_to_readable(t_minutes=climb['end_time'])}, "
               f"distance {climb['start_distance_km']:.2f} km to {climb['end_distance_km']:.2f} km")
 
     _report(100, "Done.")
@@ -4460,6 +4463,7 @@ with col_u1:
         # Only run heavy analysis when flag is set
         if st.session_state.do_analyze_now:
             st.session_state.do_analyze_now = False
+            details_lines = []
 
             cfg = build_config_from_ui(st.session_state)
 
@@ -4690,27 +4694,28 @@ if key and key in st.session_state["results"]:
     with tabs[8]:
         # “Details” (similar to your stats_details)
         st.subheader("Details")
-        lines = []
-        path = result.get("gpx_path", "")
-        fname = os.path.basename(path) if path else key
-        lines.append(f"File: {fname}")
-        if start:
-            lines.append(f"Date: {start.strftime('%Y-%m-%d')}  Start: {start.strftime('%H:%M:%S')}")
-        lines.append(f"Distance: {dist:.1f} km, Elevation gain: {elev:.0f} m, Duration: {total_dur:.1f} min")
-        lines.append(f"Avg active power: {float(result.get('avg_power_active',0)):.0f} W")
+        # lines = []
+        # path = result.get("gpx_path", "")
+        # fname = os.path.basename(path) if path else key
+        # lines.append(f"File: {fname}")
+        # if start:
+        #     lines.append(f"Date: {start.strftime('%Y-%m-%d')}  Start: {start.strftime('%H:%M:%S')}")
+        # lines.append(f"Distance: {dist:.1f} km, Elevation gain: {elev:.0f} m, Duration: {total_dur:.1f} min")
+        # lines.append(f"Avg active power: {float(result.get('avg_power_active',0)):.0f} W")
 
-        lines.append("\nClimbs (combined):")
-        combined_climbs = result.get("combined_climbs", [])
-        if not combined_climbs:
-            lines.append("  (none)")
-        else:
-            for i, c in enumerate(combined_climbs, start=1):
-                lines.append(
-                    f"  #{i}: {c.get('distance_km',0):.2f} km, {c.get('elevation_gain_m',0):.0f} m, "
-                    f"{c.get('average_grade_pct',0):.1f} %, dur {c.get('duration_min',0):.1f} min, "
-                    f"VAM {c.get('vam_m_per_h',0):.0f} m/h, P_avg {c.get('avg_power_w',0):.0f} W"
-                )
-        st.code("\n".join(lines), language="text")
+        # lines.append("\nClimbs (combined):")
+        # combined_climbs = result.get("combined_climbs", [])
+        # if not combined_climbs:
+        #     lines.append("  (none)")
+        # else:
+        #     for i, c in enumerate(combined_climbs, start=1):
+        #         lines.append(
+        #             f"  #{i}: {c.get('distance_km',0):.2f} km, {c.get('elevation_gain_m',0):.0f} m, "
+        #             f"{c.get('average_grade_pct',0):.1f} %, dur {c.get('duration_min',0):.1f} min, "
+        #             f"VAM {c.get('vam_m_per_h',0):.0f} m/h, P_avg {c.get('avg_power_w',0):.0f} W"
+        #         )
+        st.code("\n".join(details_lines), language="text")
+        
 
     with tabs[9]:
         st.subheader("Log")
