@@ -11,4 +11,4 @@ plotly
 scipy
 datetime
 zoneinfo
-tzwhere
+tzfpy
