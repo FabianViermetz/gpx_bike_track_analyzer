@@ -1,0 +1,11 @@
+streamlit
+numpy
+pandas
+gpxpy
+geopy
+meteostat
+folium
+branca
+streamlit-folium
+plotly
+scipy
