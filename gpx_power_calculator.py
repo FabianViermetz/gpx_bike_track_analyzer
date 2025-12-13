@@ -3004,8 +3004,8 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
     global REFERENCE_CDA_VALUE
     global AMBIENT_TEMP_C, AMBIENT_RHO, AMBIENT_PRES_HPA, AMBIENT_RHUM_PCT, AMBIENT_WIND_DIR_DEG, AMBIENT_WIND_SPEED_MS
 
-    EFFICIENCY = float(state["efficiency"])
-    BASE_MET_DURING_ACTIVITY = float(state["base_met"])
+    EFFICIENCY = float(state["EFFICIENCY"])
+    BASE_MET_DURING_ACTIVITY = float(state["BASE_MET_DURING_ACTIVITY"])
 
     MAX_SPEED = float(state["MAX_SPEED"])
     MAX_GRADE = float(state["MAX_GRADE"])
