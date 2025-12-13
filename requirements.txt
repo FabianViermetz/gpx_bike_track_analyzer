@@ -9,6 +9,4 @@ branca
 streamlit-folium
 plotly
 scipy
-datetime
-zoneinfo
 tzfpy
