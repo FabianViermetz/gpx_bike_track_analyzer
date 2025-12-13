@@ -8,7 +8,7 @@ import copy
 import tempfile
 import random
 from dataclasses import dataclass, asdict
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 
 import numpy as np
@@ -29,12 +29,18 @@ from plotly.subplots import make_subplots
 
 from scipy.ndimage import median_filter
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-SEGMENT_MEAN_MODE = False  # global/module-level toggle
+try:
+    from tzfpy import get_tz
+except Exception:
+    get_tz = None
 
+FIX_TIME_ZONE = True
 # === Global physical constants / limits (default values) ===
 DEFAULT_HUMAN_BODY_EFFICIENCY, EFFICIENCY = 0.23, 0.23          # human mechanical efficiency (gross)
-DEFAULT_ENERGY_BAR_SIZE_KCAL, ENERGY_BAR_SIZE_KCAL = 250, 250          # human mechanical efficiency (gross)
+DEFAULT_ENERGY_BAR_SIZE_KCAL, ENERGY_BAR_SIZE_KCAL = 250., 250.          # human mechanical efficiency (gross)
 DEFAULT_BASE_MET_DURING_ACTIVITY, BASE_MET_DURING_ACTIVITY = 1.2, 1.2  # ~light activity; tweak if you want  # [dimensionless MET]
 DEFAULT_G, G = 9.81, 9.81                   # m/s²
 
@@ -44,9 +50,9 @@ DEFAULT_MAX_SPEED, MAX_SPEED = 120.0, 120.0          # km/h (for filters & histo
 DEFAULT_MAX_GRADE, MAX_GRADE = 35.0, 35.0           # % absolute max grade for filters
 DEFAULT_MAX_PWR, MAX_PWR = 1200.0, 1200.0           # W for filters & histograms
 
-DEFAULT_TARGET_CADENCE = 85   # RPM
-DEFAULT_HYSTERESIS_REAR_RPM, HYSTERESIS_REAR_RPM = 15, 15      # RPM hysteresis for rear shifts
-DEFAULT_MIN_SHIFT_INTERVAL_REAR_SEC, MIN_SHIFT_INTERVAL_REAR_SEC = 15, 15  # s min time between rear shifts
+DEFAULT_TARGET_CADENCE = 85.   # RPM
+DEFAULT_HYSTERESIS_REAR_RPM, HYSTERESIS_REAR_RPM = 15., 15.      # RPM hysteresis for rear shifts
+DEFAULT_MIN_SHIFT_INTERVAL_REAR_SEC, MIN_SHIFT_INTERVAL_REAR_SEC = 15., 15.  # s min time between rear shifts
 
 # Speeds used in filtering
 DEFAULT_MIN_ACTIVE_SPEED, MIN_ACTIVE_SPEED = 1.0, 1.0     # km/h: above this counts as "active" riding
@@ -65,21 +71,34 @@ DEFAULT_COMBINE_BREAK_MAX_TIME_DIFF, COMBINE_BREAK_MAX_TIME_DIFF = 2.0, 2.0  # M
 DEFAULT_COMBINE_BREAK_MAX_DISTANCE, COMBINE_BREAK_MAX_DISTANCE = 100.0, 100.0  # Meters
 
 DEFAULT_CLIMB_MIN_DISTANCE_KM, CLIMB_MIN_DISTANCE_KM = 1., 1.  # km
-DEFAULT_CLIMB_MIN_ELEVATION_GAIN_M, CLIMB_MIN_ELEVATION_GAIN_M = 35, 35 # m
-DEFAULT_CLIMB_END_AVERAGE_GRADE_PCT, CLIMB_END_AVERAGE_GRADE_PCT = 1, 1  # %
+DEFAULT_CLIMB_MIN_ELEVATION_GAIN_M, CLIMB_MIN_ELEVATION_GAIN_M = 35., 35. # m
+DEFAULT_CLIMB_END_AVERAGE_GRADE_PCT, CLIMB_END_AVERAGE_GRADE_PCT = 1., 1.  # %
 DEFAULT_CLIMB_END_WINDOW_SIZE_M, CLIMB_END_WINDOW_SIZE_M = 20.0, 20.0  # meters
-DEFAULT_MAX_DIST_BETWEEN_CLIMBS_M, MAX_DIST_BETWEEN_CLIMBS_M = 500, 500  # meters
+DEFAULT_MAX_DIST_BETWEEN_CLIMBS_M, MAX_DIST_BETWEEN_CLIMBS_M = 500., 500.  # meters
 
 DEFAULT_BRAKE_DISTRIBUTION_FRONT, BRAKE_DISTRIBUTION_FRONT = 0.6, 0.6          # fraction of total braking power to one disk (assuming two disks)
-DEFAULT_BRAKE_FRONT_DIAMETER_MM, BRAKE_FRONT_DIAMETER_MM = 160, 160              # 160 mm rotor
-DEFAULT_BRAKE_REAR_DIAMETER_MM, BRAKE_REAR_DIAMETER_MM = 160, 160              # 160 mm rotor
+DEFAULT_BRAKE_FRONT_DIAMETER_MM, BRAKE_FRONT_DIAMETER_MM = 160., 160.              # 160 mm rotor
+DEFAULT_BRAKE_REAR_DIAMETER_MM, BRAKE_REAR_DIAMETER_MM = 160., 160.              # 160 mm rotor
 DEFAULT_BRAKE_ADD_COOLING_FACTOR, BRAKE_ADD_COOLING_FACTOR = 0.3, 0.3             # empirical cooling factor -> 30% additional cooling area (much higher for icetech rotors)
 DEFAULT_BRAKE_PERFORATION_FACTOR, BRAKE_PERFORATION_FACTOR = 0.3, 0.3          # fraction of rotor area that is holes (30% typical)
 
-DEFAULT_SMOOTHING_WINDOW_SIZE_S, SMOOTHING_WINDOW_SIZE_S = 3, 3  # meters
+DEFAULT_SMOOTHING_WINDOW_SIZE_S, SMOOTHING_WINDOW_SIZE_S = 3., 3.  # meters
 
+DEFAULT_REFERENCE_ROLLING_LOSS,REFERENCE_ROLLING_LOSS = 13.7, 13.7 # Continental Grand Prix TR 28; watts according to https://www.bicyclerollingresistance.com calculation based on 18mph, 94lbs
+REFERENCE_LOAD_FOR_CRR_KG = 42.6376827 
+REFERENCE_SPEED_FOR_CRR_MS = 8.04672
 
 REFERENCE_HEIGHT_FOR_CDA = 1.80 # 1.80 as reference for the cda. so cda can be calculated using the body height
+
+DEFAULT_AMBIENT_WIND_SPEED_MS, AMBIENT_WIND_SPEED_MS = 0., 0.
+DEFAULT_AMBIENT_WIND_DIR_DEG, AMBIENT_WIND_DIR_DEG = 0., 0.
+DEFAULT_AMBIENT_TEMP_C, AMBIENT_TEMP_C = 20., 20.
+DEFAULT_AMBIENT_PRES_HPA, AMBIENT_PRES_HPA = 1013., 1013.
+DEFAULT_AMBIENT_RHUM_PCT, AMBIENT_RHUM_PCT = 50., 50.
+DEFAULT_AMBIENT_RHO, AMBIENT_RHO = 1.225, 1.225
+
+SEGMENT_MEAN_MODE = False  # global/module-level toggle
+
 
 @dataclass
 class RiderBikeConfig:
@@ -105,6 +124,32 @@ class RiderBikeConfig:
 # =====================================================================
 # Analysis functions
 # =====================================================================
+
+
+def utc_to_local_from_gps(dt_utc: datetime, lat: float, lon: float, fallback_tz: str = "Europe/Berlin") -> datetime:
+    """
+    Convert timezone-aware UTC datetime to local time based on GPS position.
+    If lookup fails, fall back to fallback_tz.
+    """
+    if dt_utc.tzinfo is None:
+        # treat as UTC if naive
+        from datetime import timezone
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+
+    tzname = None
+    if get_tz is not None:
+        try:
+            tzname = get_tz(lon, lat)  # note order: (lon, lat)
+        except Exception:
+            tzname = None
+
+    try:
+        print(dt_utc)
+        return dt_utc.astimezone(ZoneInfo(tzname or fallback_tz))
+    except Exception:
+        print(dt_utc)
+        return dt_utc
+
 
 def time_to_readable(t_days=0, t_hours=0, t_minutes=0, t_seconds=0, no_break=False):
     total_seconds = (
@@ -139,7 +184,7 @@ def time_to_readable(t_days=0, t_hours=0, t_minutes=0, t_seconds=0, no_break=Fal
         parts.append(f"{int(seconds)}s")
     if no_break and len(parts) > 1:
         return ''.join(parts)
-    return ' '.join(parts)
+    return '\u00A0'.join(parts)
 
 
 def hampel_fast(x, window_size=5, n_sigmas=3.0):
@@ -320,12 +365,12 @@ def get_meteostat_series(latitudes, longitudes, times, use_wind_data=True):
         print("Wind data disabled, using defaults & standard density.")
         n = len(times)
         return {
-            "wspd_ms": np.zeros(n),
-            "wdir_deg": np.zeros(n),
-            "temp_c":  np.full(n, 20.0),
-            "pres_hpa": np.full(n, 1013.0),
-            "rhum_pct": np.full(n, 50.0),
-            "rho":     np.full(n, 1.225),
+            "wspd_ms": np.full(n, AMBIENT_WIND_SPEED_MS),
+            "wdir_deg": np.full(n, AMBIENT_WIND_DIR_DEG),
+            "temp_c":  np.full(n, AMBIENT_TEMP_C),
+            "pres_hpa": np.full(n, AMBIENT_PRES_HPA),
+            "rhum_pct": np.full(n, AMBIENT_RHUM_PCT),
+            "rho":     np.full(n, AMBIENT_RHO),
         }
 
     mid_lat = float(np.mean(latitudes))
@@ -1411,16 +1456,60 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
     prev_point = None
     prev_time = None
 
+    # --- NEW: timezone-fix helpers/state (fixed) ---
+    times_utc_used = []          # authoritative timeline for computations
+    times_local_display = []     # only for UI / printing (optional)
+
+    track_tzinfo = None          # determine once for whole track
+    prev_time_utc = None
+    # ----------------------------------------------
+
     for track in gpx.tracks:
         for segment in track.segments:
-            for point in segment.points:
+            for i, point in enumerate(segment.points):
                 if point.time is None:
                     continue
 
                 lats.append(point.latitude)
                 lons.append(point.longitude)
                 raw_alts.append(point.elevation)
-                times.append(point.time)
+
+                # ---------- time handling (robust) ----------
+                dt = point.time
+
+                # normalize to aware UTC
+                if dt.tzinfo is None:
+                    dt_utc = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt_utc = dt.astimezone(timezone.utc)
+
+                # enforce strictly increasing UTC (protect speed/resampling)
+                if prev_time_utc is not None and dt_utc <= prev_time_utc:
+                    dt_utc = prev_time_utc + timedelta(seconds=1)
+
+                prev_time_utc = dt_utc
+                times_utc_used.append(dt_utc)
+
+                # what you store in `times` should be UTC for all calculations
+                times.append(dt_utc)
+
+                # optional: compute local time for display only
+                if FIX_TIME_ZONE:
+                    try:
+                        if track_tzinfo is None:
+                            # determine tz once from first valid point/time
+                            dt_local_first = utc_to_local_from_gps(
+                                dt_utc, float(point.latitude), float(point.longitude)
+                            )
+                            track_tzinfo = dt_local_first.tzinfo
+
+                        if track_tzinfo is not None:
+                            times_local_display.append(dt_utc.astimezone(track_tzinfo))
+                        else:
+                            times_local_display.append(dt_utc)
+                    except Exception:
+                        times_local_display.append(dt_utc)
+                # --------------------------------------------
 
                 hr_v, cad_v, pwr_v, temp_v = _extract_point_sensors(point)
                 hr_raw.append(hr_v)
@@ -1433,8 +1522,13 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
                         (prev_point.latitude, prev_point.longitude),
                         (point.latitude, point.longitude)
                     ).meters
-                    time_diff = (point.time - prev_time).total_seconds()
-                    speed = dist / time_diff if time_diff > 0 else 0.0
+
+                    # IMPORTANT: always use UTC for dt
+                    time_diff = (times[-1] - prev_time).total_seconds()
+                    if time_diff <= 0:
+                        time_diff = 1.0  # safety; should be rare due to monotonic clamp
+
+                    speed = dist / time_diff
                     speeds.append(speed * 3.6)
                     dists.append(dist / 1000.0)
                 else:
@@ -1442,10 +1536,13 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
                     dists.append(0.0)
 
                 prev_point = point
-                prev_time = point.time
+                prev_time = times[-1]  # UTC
+
 
     cut_beginning = 0
     cut_end = 0
+    # store both for later use
+    times = times_local_display if FIX_TIME_ZONE else None
     lats = lats[cut_beginning:cut_end-1]
     lons = lons[cut_beginning:cut_end-1]
     raw_alts = raw_alts[cut_beginning:cut_end-1]
@@ -1456,6 +1553,7 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
     temp_dev_raw = temp_dev_raw[cut_beginning:cut_end-1]
     speeds = speeds[cut_beginning:cut_end-1]
     dists = dists[cut_beginning:cut_end-1]
+
     
     if len(times) == 0:
         raise ValueError("No time data found in GPX file.")
@@ -2654,6 +2752,7 @@ def analyze_gpx_file(
     result = {
         "gpx_path": gpx_path,
         "timestep_min": timestep_min,
+        "filtered_times": filtered["filtered_times"],
         "filtered_dists": filtered["filtered_dists"],
         "filtered_lats": filtered["filtered_lats"],
         "filtered_lons": filtered["filtered_lons"],
@@ -2892,10 +2991,60 @@ def render_log():
 # Config helpers
 # =============================================================================
 def build_config_from_ui(state) -> "RiderBikeConfig":
+    
+    global BRAKE_FRONT_DIAMETER_MM, BRAKE_REAR_DIAMETER_MM
+    global BRAKE_ADD_COOLING_FACTOR, BRAKE_PERFORATION_FACTOR, BRAKE_DISTRIBUTION_FRONT
+    global EFFICIENCY, MAX_SPEED, MAX_GRADE, MAX_PWR, BASE_MET_DURING_ACTIVITY
+    global HYSTERESIS_REAR_RPM, MIN_SHIFT_INTERVAL_REAR_SEC
+    global MAX_MAP_POINTS, MIN_VALID_SPEED, MIN_ACTIVE_SPEED
+    global COMBINE_BREAK_MAX_TIME_DIFF, COMBINE_BREAK_MAX_DISTANCE
+    global G
+    global CLIMB_MIN_DISTANCE_KM, CLIMB_MIN_ELEVATION_GAIN_M, CLIMB_END_AVERAGE_GRADE_PCT, CLIMB_END_WINDOW_SIZE_M, MAX_DIST_BETWEEN_CLIMBS_M
+    global SMOOTHING_WINDOW_SIZE_S
+    global REFERENCE_CDA_VALUE
+    global AMBIENT_TEMP_C, AMBIENT_RHO, AMBIENT_PRES_HPA, AMBIENT_RHUM_PCT, AMBIENT_WIND_DIR_DEG, AMBIENT_WIND_SPEED_MS
+
+    EFFICIENCY = float(state["efficiency"])
+    BASE_MET_DURING_ACTIVITY = float(state["base_met"])
+
+    MAX_SPEED = float(state["MAX_SPEED"])
+    MAX_GRADE = float(state["MAX_GRADE"])
+    MAX_PWR = float(state["MAX_PWR"])
+    MIN_ACTIVE_SPEED = float(state["MIN_ACTIVE_SPEED"])
+    MIN_VALID_SPEED = float(state["MIN_VALID_SPEED"])
+
+    HYSTERESIS_REAR_RPM = int(state["HYSTERESIS_REAR_RPM"])
+    MIN_SHIFT_INTERVAL_REAR_SEC = int(state["MIN_SHIFT_INTERVAL_REAR_SEC"])
+    MAX_MAP_POINTS = int(state["MAX_MAP_POINTS"])
+    COMBINE_BREAK_MAX_TIME_DIFF = int(state["COMBINE_BREAK_MAX_TIME_DIFF"])
+    COMBINE_BREAK_MAX_DISTANCE = int(state["COMBINE_BREAK_MAX_DISTANCE"])
+    G = float(state["GRAVITY"])
+    CLIMB_MIN_DISTANCE_KM = float(state["CLIMB_MIN_DISTANCE_KM"])
+    CLIMB_MIN_ELEVATION_GAIN_M = int(state["CLIMB_MIN_ELEVATION_GAIN_M"])
+    CLIMB_END_AVERAGE_GRADE_PCT = float(state["CLIMB_END_AVERAGE_GRADE_PCT"])
+    CLIMB_END_WINDOW_SIZE_M = int(state["CLIMB_END_WINDOW_SIZE_M"])
+    MAX_DIST_BETWEEN_CLIMBS_M = int(state["MAX_DIST_BETWEEN_CLIMBS_M"])
+    SMOOTHING_WINDOW_SIZE_S = int(state["SMOOTHING_WINDOW_SIZE_S"])
+    BRAKE_FRONT_DIAMETER_MM = float(state["BRAKE_FRONT_DIAMETER_MM"])
+    BRAKE_REAR_DIAMETER_MM = float(state["BRAKE_REAR_DIAMETER_MM"])
+    BRAKE_ADD_COOLING_FACTOR = float(state["BRAKE_ADD_COOLING_FACTOR"])
+    BRAKE_PERFORATION_FACTOR = float(state["BRAKE_PERFORATION_FACTOR"])
+    BRAKE_DISTRIBUTION_FRONT = float(state["BRAKE_DISTRIBUTION_FRONT"])
+    REFERENCE_CDA_VALUE = float(state["REFERENCE_CDA_VALUE"])
+
+    AMBIENT_TEMP_C = float(state["AMBIENT_TEMP_C"])
+    AMBIENT_RHO = float(state["AMBIENT_RHO"])
+    AMBIENT_PRES_HPA = float(state["AMBIENT_PRES_HPA"])
+    AMBIENT_RHUM_PCT = float(state["AMBIENT_RHUM_PCT"])
+    AMBIENT_WIND_DIR_DEG = float(state["AMBIENT_WIND_DIR_DEG"])
+    AMBIENT_WIND_SPEED_MS = float(state["AMBIENT_WIND_SPEED_MS"])
+
     # Keep your original scaling logic for CdA with height
     # cda_scaled = REFERENCE_CDA_VALUE * (1 - 0.5*(1-(height/REFERENCE_HEIGHT_FOR_CDA)))
     height = float(state["body_height"])
-    cda_scaled = float(state["ref_cda"]) * (1.0 - 0.5 * (1.0 - (height / float(state["ref_height_for_cda"]))))
+    CDA_VALUE = float(REFERENCE_CDA_VALUE) * (1.0 - 0.5 * (1.0 - (height / REFERENCE_HEIGHT_FOR_CDA)))
+    calculated_crr = float(state["REFERENCE_ROLLING_LOSS"]) / (REFERENCE_LOAD_FOR_CRR_KG * 9.81 * REFERENCE_SPEED_FOR_CRR_MS)
+
 
     front_teeth = [int(x.strip()) for x in str(state["front_teeth"]).split(",") if x.strip()]
     rear_teeth  = [int(x.strip()) for x in str(state["rear_teeth"]).split(",") if x.strip()]
@@ -2905,8 +3054,8 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
         body_height=height,
         bike_mass=float(state["bike_mass"]),
         extra_mass=float(state["extra_mass"]),
-        cda=float(cda_scaled),
-        crr=float(state["crr"]),
+        cda=float(CDA_VALUE),
+        crr=calculated_crr,
         drivetrain_loss=float(state["drivetrain_loss"]),
         wheel_circumference=float(state["wheel_circ"]),
         front_der_teeth=front_teeth,
@@ -2915,20 +3064,6 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
         draft_effect_dh=float(state["draft_effect_dh"]),
         draft_effect_uh=float(state["draft_effect_uh"]),
     )
-
-
-def apply_advanced_globals(state):
-    """
-    If your analyze code uses module-level globals (like in Qt version),
-    update them here. If instead you can pass these into analyze_gpx_file,
-    prefer passing rather than globals.
-    """
-    # Example:
-    # import your_module as M
-    # M.EFFICIENCY = float(state["efficiency"])
-    # M.G = float(state["gravity"])
-    # ...
-    pass
 
 
 def _arr(x, dtype=float):
@@ -3211,7 +3346,7 @@ def plot_segments(result):
 
     fig.update_layout(
         barmode="overlay",  # stacking is manual via base=
-        title="5 km segments – Power Components (running stack, right-aligned shrinking bars)",
+        title="5 km segments – Power Components",
         xaxis_title="5 km segments",
         yaxis_title="Average power [W]",
         height=520,
@@ -3452,7 +3587,8 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
     lats_full = np.asarray(result["filtered_lats"], dtype=float)
     lons_full = np.asarray(result["filtered_lons"], dtype=float)
     d_full = np.asarray(result["filtered_dists"], dtype=float)
-
+    timestamps = np.asarray(result["filtered_times"])
+    total_break_duration = result["long_break_total_min"] + result["short_break_total_min"]
     if lats_full.size == 0 or lons_full.size == 0:
         return None, None, None
 
@@ -3544,33 +3680,111 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
     # Start/end markers
     full_positions = list(zip(lats_full.tolist(), lons_full.tolist()))
     folium.Marker(full_positions[0], popup="Start").add_to(m)
-    folium.Marker(full_positions[-1], popup="End").add_to(m)
+    folium.Marker(full_positions[-1],
+                  popup=(
+                      f"End<br>"
+                      f"Total\u00A0Duration:\u00A0{time_to_readable(t_seconds=timestamps[-1].timestamp() - timestamps[0].timestamp())}<br>"
+                      f"Ride\u00A0Duration:\u00A0{time_to_readable(t_minutes=(timestamps[-1].timestamp()/60. - timestamps[0].timestamp()/60.)-total_break_duration)}<br>"
+                      f"Break\u00A0Duration:\u00A0{time_to_readable(t_minutes=total_break_duration)}<br>"
+                         )
+                  ).add_to(m)
 
     # Distance markers
     if marker_spacing_km > 0 and d_full.size > 0:
         next_mark = float(marker_spacing_km)
         for i, (d_km, lat, lon) in enumerate(zip(d_full, lats_full, lons_full)):
             if d_km + 1e-9 >= next_mark:
-                t_ = float(result.get("timestep_min", 1.0))
-                t_minutes = i * t_
+                t_minutes = timestamps[i].timestamp()/60. - timestamps[0].timestamp()/60.
                 folium.CircleMarker(
                     location=[float(lat), float(lon)],
                     radius=3,
                     color="red",
                     fill=True,
                     fillOpacity=0.9,
-                    popup=f"{next_mark:.1f} km\nTime: {t_minutes:.1f} min"
+                    popup=(
+                        f"Distance:\u00A0{next_mark:.1f}\u00A0km<br>"
+                        f"Time:\u00A0{time_to_readable(t_minutes=t_minutes)}"
+                    )
                 ).add_to(m)
                 next_mark += float(marker_spacing_km)
 
-    # Break markers (re-use your already computed breaks if present)
-    for b in result.get("breaks", []):
-        lat_b = b["lat"]; lon_b = b["lon"]
-        dur = b["duration_min"]; btype = b["type"]
-        radius = 6 if btype == "long" else 4
-        color = "darkgreen" if btype == "long" else "orange"
-        folium.CircleMarker([lat_b, lon_b], radius=radius, color=color, fill=True, fillOpacity=0.9,
-                            popup=f"{btype} break: {dur:.1f} min").add_to(m)
+    # combine break markers close to each other (time + distance)
+    combined_breaks = []
+    breaks = result.get("breaks", [])
+    if breaks:
+        breaks_sorted = sorted(breaks, key=lambda b: b["time_min"])
+        current = breaks_sorted[0].copy()
+        current["break_count"] = 1  # number of merged breaks
+
+        for b in breaks_sorted[1:]:
+            # time difference between end of current cluster and start of next break
+            dt_min = b["time_min"] - (current["time_min"] + current["duration_min"])
+            try:
+                dist_m = geodesic(
+                    (current["lat"], current["lon"]),
+                    (b["lat"], b["lon"])
+                ).meters
+            except ValueError:
+                # if we get bad coordinates for any reason, don't merge
+                dist_m = COMBINE_BREAK_MAX_DISTANCE + 1.0
+
+            if dt_min <= COMBINE_BREAK_MAX_TIME_DIFF and dist_m <= COMBINE_BREAK_MAX_DISTANCE:
+                # merge b into current cluster with weighted averages
+                n = current["break_count"]
+
+                # total duration is just sum
+                current["duration_min"] += b["duration_min"]
+
+                # distance: average over breaks
+                current["distance_km"] = (current["distance_km"] * n + b["distance_km"]) / (n + 1)
+
+                # lat/lon: average over breaks
+                current["lat"] = (current["lat"] * n + b["lat"]) / (n + 1)
+                current["lon"] = (current["lon"] * n + b["lon"]) / (n + 1)
+
+                current["break_count"] = n + 1
+
+                # upgrade to long break if combined duration exceeds threshold
+                if current["duration_min"] >= long_break_thr_min:
+                    current["type"] = "long"
+            else:
+                combined_breaks.append(current)
+                current = b.copy()
+                current["break_count"] = 1
+
+        combined_breaks.append(current)
+    else:
+        combined_breaks = []
+
+    # Markers for breaks
+    for b in combined_breaks:
+        lat_b = b["lat"]
+        lon_b = b["lon"]
+        dur = b["duration_min"]
+        btype = b["type"]
+        btime = b["time_min"]
+        bdist = b["distance_km"]
+        bcount = b.get("break_count", 1)
+        if btype == "long":
+            color = "darkgreen"
+            radius = 6
+            label = "Long break"
+        else:
+            color = "orange"
+            radius = 4
+            label = "Short break"
+        folium.CircleMarker(
+            location=[lat_b, lon_b],
+            radius=radius,
+            color=color,
+            fill=True,
+            fillOpacity=0.9,
+            popup=f"{label}:<br>"
+                f"Time:\u00A0{time_to_readable(t_minutes=btime)}<br>"
+                f"Duration:\u00A0{time_to_readable(t_minutes=dur)}<br>"
+                f"Distance:\u00A0{bdist:.2f}\u00A0km<br>"
+                f"{f'Combined\u00A0Breaks:\u00A0{bcount}' if bcount > 1 else ''}"
+        ).add_to(m)
 
     return m, values_full, caption
 
@@ -3780,61 +3994,436 @@ with st.sidebar:
     st.header("Settings")
 
     # Basic settings
-    st.session_state["use_wind"] = st.checkbox("Use weather data (Meteostat)", value=False)
-    st.session_state["target_cadence"] = st.number_input("Target cadence [RPM]", min_value=40, max_value=140, value=85, step=1)
+    with st.expander("Rider and Behavior", expanded=True):
+        st.session_state["body_mass"] = st.number_input(
+            "Rider mass [kg]",
+            min_value=30.0,
+            max_value=150.0,
+            value=70.0,
+            step=0.5,
+            help="Total rider mass.\n\nDefault: 70.0 kg",
+        )
+        st.session_state["body_height"] = st.number_input(
+            "Rider height [m]",
+            min_value=1.0,
+            max_value=2.5,
+            value=1.80,
+            step=0.01,
+            help="Rider height used for CdA scaling (if applicable).\n\nDefault: 1.80 m",
+        )
+        st.session_state["draft_effect"] = st.number_input(
+            "Level draft factor [-]",
+            min_value=0.1,
+            max_value=1.5,
+            value=1.0,
+            step=0.05,
+            help=f"Aerodynamic drafting multiplier on flat terrain (1.0 = no draft, 0.8 = 20 % reduced air drag).\n\nDefault: 1.0 [-]",
+        )
+        st.session_state["draft_effect_dh"] = st.number_input(
+            "Downhill draft factor [-]",
+            min_value=0.1,
+            max_value=1.5,
+            value=1.0,
+            step=0.05,
+            help="Drafting downhill?! Who does this?\n\nDefault: 1.0 [-]",
+        )
+        st.session_state["draft_effect_uh"] = st.number_input(
+            "Uphill draft factor [-]",
+            min_value=0.1,
+            max_value=1.5,
+            value=1.0,
+            step=0.05,
+            help="Drafting uphill? consider pro career!\n\nDefault: 1.0 [-]",
+        )
+        st.session_state["target_cadence"] = st.number_input(
+            "Target cadence [RPM]",
+            min_value=40,
+            max_value=140,
+            value=85,
+            step=1,
+            help="Cadence the rider tries to maintain during active pedaling.\n\nDefault: 85 RPM",
+        )
 
-    st.session_state["body_mass"] = st.number_input("Rider mass [kg]", min_value=30.0, max_value=150.0, value=70.0, step=0.5)
-    st.session_state["body_height"] = st.number_input("Rider height [m]", min_value=1.0, max_value=2.5, value=1.80, step=0.01)
+    with st.expander("Bike", expanded=True):
+        st.session_state["front_teeth"] = st.text_input(
+            "Front teeth (comma-separated)",
+            value="34,50",
+            help='Chainring tooth counts, comma-separated. Example: "34,50".\n\nDefault: 34,50',
+        )
+        st.session_state["rear_teeth"] = st.text_input(
+            "Rear teeth (comma-separated)",
+            value="11,12,13,14,15,17,19,21,24,28,32",
+            help='Cassette tooth counts, comma-separated. Example: "11,12,13,...".\n\nDefault: 11,12,13,14,15,17,19,21,24,28,32',
+        )
+        st.session_state["bike_mass"] = st.number_input(
+            "Bike mass [kg]",
+            min_value=3.0,
+            max_value=30.0,
+            value=9.0,
+            step=0.5,
+            help="Bike mass without rider.\n\nDefault: 9.0 kg",
+        )
+        st.session_state["extra_mass"] = st.number_input(
+            "Extra mass [kg]",
+            min_value=0.0,
+            max_value=30.0,
+            value=3.0,
+            step=0.5,
+            help="Extra carried mass (bags, bottles, tools, etc.).\n\nDefault: 3.0 kg",
+        )
+        st.session_state["BRAKE_FRONT_DIAMETER_MM"] = st.number_input(
+            "Front brake dia [mm]",
+            min_value=100.0,
+            max_value=300.0,
+            value=float(DEFAULT_BRAKE_FRONT_DIAMETER_MM),
+            step=1.0,
+            help=(
+                "Front rotor diameter used by the brake temperature/energy model (if enabled).\n\n"
+                f"Default: {DEFAULT_BRAKE_FRONT_DIAMETER_MM:.0f} mm"
+            ),
+        )
+        st.session_state["BRAKE_REAR_DIAMETER_MM"] = st.number_input(
+            "Rear brake dia [mm]",
+            min_value=80.0,
+            max_value=300.0,
+            value=float(DEFAULT_BRAKE_REAR_DIAMETER_MM),
+            step=1.0,
+            help=(
+                "Rear rotor diameter used by the brake temperature/energy model (if enabled).\n\n"
+                f"Default: {DEFAULT_BRAKE_REAR_DIAMETER_MM:.0f} mm"
+            ),
+        )
+        st.session_state["REFERENCE_ROLLING_LOSS"] = st.number_input(
+            "Single Wheel Rolling loss [W]",
+            min_value=0.0,
+            max_value=40.0,
+            value=float(DEFAULT_REFERENCE_ROLLING_LOSS),
+            step=0.01,
+            format="%.3f",
+            help=(
+                "Constant rolling loss per wheel at the reference condition (used by your rolling model).\n\n"
+                f"Default: {DEFAULT_REFERENCE_ROLLING_LOSS:.3f} W"
+            ),
+        )
 
-    st.session_state["bike_mass"] = st.number_input("Bike mass [kg]", min_value=3.0, max_value=30.0, value=8.0, step=0.5)
-    st.session_state["extra_mass"] = st.number_input("Extra mass [kg]", min_value=0.0, max_value=30.0, value=3.0, step=0.5)
+    with st.expander("Environment", expanded=False):
+        # --- Ambient / environment overrides (manual) ---
+        st.session_state["use_wind"] = st.checkbox(
+            "Use weather data (Meteostat)",
+            value=False,
+            help="If enabled, use Meteostat weather. If disabled, use the ambient overrides below.\n\nDefault: off",
+        )
 
-    st.session_state["crr"] = st.number_input("Crr [-]", min_value=0.001, max_value=0.02, value=0.00366, step=0.0001, format="%.5f")
-    st.session_state["drivetrain_loss"] = st.number_input("Drivetrain loss [-]", min_value=0.0, max_value=0.2, value=0.03, step=0.005, format="%.3f")
-    st.session_state["wheel_circ"] = st.number_input("Wheel circumference [m]", min_value=1.5, max_value=2.8, value=2.096, step=0.001, format="%.3f")
+        st.session_state["AMBIENT_WIND_SPEED_MS"] = st.number_input(
+            "Ambient wind speed [m/s]",
+            min_value=0.0,
+            max_value=40.0,
+            value=float(AMBIENT_WIND_SPEED_MS),
+            step=0.1,
+            format="%.1f",
+            help=(
+                "Background wind speed magnitude. Used if weather data is disabled or as a constant override.\n\n"
+                f"Default: {DEFAULT_AMBIENT_WIND_SPEED_MS:.1f} m/s"
+            ),
+        )
 
-    st.session_state["front_teeth"] = st.text_input("Front teeth (comma-separated)", value="34,50")
-    st.session_state["rear_teeth"] = st.text_input("Rear teeth (comma-separated)", value="11,12,13,14,15,17,19,21,24,28,32")
+        st.session_state["AMBIENT_WIND_DIR_DEG"] = st.number_input(
+            "Ambient wind direction [°]",
+            min_value=0.0,
+            max_value=360.0,
+            value=float(AMBIENT_WIND_DIR_DEG),
+            step=1.0,
+            format="%.0f",
+            help=(
+                "Wind direction in degrees. Ensure consistency with your model "
+                "(meteorological 'from' vs mathematical 'to').\n\n"
+                f"Default: {DEFAULT_AMBIENT_WIND_DIR_DEG:.0f} °"
+            ),
+        )
 
-    st.session_state["draft_effect"] = st.number_input("Level draft factor [-]", min_value=0.1, max_value=1.5, value=1.0, step=0.05)
-    st.session_state["draft_effect_dh"] = st.number_input("Downhill draft factor [-]", min_value=0.1, max_value=1.5, value=1.0, step=0.05)
-    st.session_state["draft_effect_uh"] = st.number_input("Uphill draft factor [-]", min_value=0.1, max_value=1.5, value=1.0, step=0.05)
+        st.session_state["AMBIENT_TEMP_C"] = st.number_input(
+            "Ambient temperature [°C]",
+            min_value=-30.0,
+            max_value=50.0,
+            value=float(AMBIENT_TEMP_C),
+            step=0.5,
+            format="%.1f",
+            help=(
+                "Air temperature. Affects air density and human thermoregulation (PHS).\n\n"
+                f"Default: {DEFAULT_AMBIENT_TEMP_C:.1f} °C"
+            ),
+        )
 
-    st.session_state["marker_spacing_km"] = st.number_input("Map markers every [km]", min_value=0.5, max_value=1000.0, value=5.0, step=0.5)
-    st.session_state["long_break_threshold_min"] = st.number_input("Long break threshold [min]", min_value=1.0, max_value=180.0, value=10.0, step=0.5)
+        st.session_state["AMBIENT_PRES_HPA"] = st.number_input(
+            "Ambient pressure [hPa]",
+            min_value=800.0,
+            max_value=1100.0,
+            value=float(AMBIENT_PRES_HPA),
+            step=1.0,
+            format="%.0f",
+            help=(
+                "Barometric air pressure. Sea level is ~1013 hPa; decreases with altitude.\n\n"
+                f"Default: {DEFAULT_AMBIENT_PRES_HPA:.0f} hPa"
+            ),
+        )
 
-    st.divider()
+        st.session_state["AMBIENT_RHUM_PCT"] = st.number_input(
+            "Ambient relative humidity [%]",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(AMBIENT_RHUM_PCT),
+            step=1.0,
+            format="%.0f",
+            help=(
+                "Relative humidity of the air. Strongly affects evaporative cooling and sweat efficiency.\n\n"
+                f"Default: {DEFAULT_AMBIENT_RHUM_PCT:.0f} %"
+            ),
+        )
+
+        st.session_state["AMBIENT_RHO"] = st.number_input(
+            "Ambient air density ρ [kg/m³]",
+            min_value=0.80,
+            max_value=1.35,
+            value=float(AMBIENT_RHO),
+            step=0.005,
+            format="%.3f",
+            help=(
+                "Air density override. If set manually, ensure consistency with pressure and temperature.\n\n"
+                f"Default: {DEFAULT_AMBIENT_RHO:.3f} kg/m³"
+            ),
+        )
+
+        st.session_state["GRAVITY"] = st.number_input(
+            "Gravity [m/s²]",
+            min_value=9.0,
+            max_value=10.0,
+            value=DEFAULT_G,
+            step=0.0001,
+            format="%.4f",
+            help=f"Gravitational acceleration.\n\nDefault: {DEFAULT_G:.3f} m/s²",
+        )
+
+    with st.expander("Analysis", expanded=False):
+        st.session_state["MAX_SPEED"] = st.number_input(
+            "Max speed [km/h]",
+            min_value=10.0,
+            max_value=200.0,
+            value=float(DEFAULT_MAX_SPEED),
+            step=5.0,
+            help=f"Upper bound for plotting/histograms and some sanity clipping.\n\nDefault: {DEFAULT_MAX_SPEED:.1f} km/h",
+        )
+        st.session_state["MAX_GRADE"] = st.number_input(
+            "Max grade [%]",
+            min_value=1.0,
+            max_value=100.0,
+            value=float(DEFAULT_MAX_GRADE),
+            step=1.0,
+            help=f"Upper bound for plotting/histograms and some sanity clipping.\n\nDefault: {DEFAULT_MAX_GRADE:.0f} %",
+        )
+        st.session_state["MAX_PWR"] = st.number_input(
+            "Max power [W]",
+            min_value=100.0,
+            max_value=3000.0,
+            value=float(DEFAULT_MAX_PWR),
+            step=50.0,
+            help=f"Upper bound for plotting/histograms and some sanity clipping.\n\nDefault: {DEFAULT_MAX_PWR:.0f} W",
+        )
+        st.session_state["MIN_ACTIVE_SPEED"] = st.number_input(
+            "Min active speed [km/h]",
+            min_value=0.0,
+            max_value=20.0,
+            value=float(DEFAULT_MIN_ACTIVE_SPEED),
+            step=0.1,
+            help=f"Speed threshold to consider the rider 'active' (vs standing/break).\n\nDefault: {DEFAULT_MIN_ACTIVE_SPEED:.1f} km/h",
+        )
+        st.session_state["MIN_VALID_SPEED"] = st.number_input(
+            "Min valid speed [km/h]",
+            min_value=0.0,
+            max_value=20.0,
+            value=float(DEFAULT_MIN_VALID_SPEED),
+            step=0.1,
+            help=f"Lower speed cutoff for validity checks (e.g., GPS jitter / near-zero noise).\n\nDefault: {DEFAULT_MIN_VALID_SPEED:.1f} km/h",
+        )
+        st.session_state["COMBINE_BREAK_MAX_TIME_DIFF"] = st.number_input(
+            "Combine Breaks within [min]",
+            min_value=1.0,
+            max_value=60.0,
+            value=float(DEFAULT_COMBINE_BREAK_MAX_TIME_DIFF),
+            step=1.0,
+            help=f"Merge breaks if their timestamps are within this time difference.\n\nDefault: {DEFAULT_COMBINE_BREAK_MAX_TIME_DIFF:.0f} min",
+        )
+        st.session_state["COMBINE_BREAK_MAX_DISTANCE"] = st.number_input(
+            "Combine Breaks within [m]",
+            min_value=1.0,
+            max_value=1000.0,
+            value=float(DEFAULT_COMBINE_BREAK_MAX_DISTANCE),
+            step=1.0,
+            help=f"Merge breaks if their locations are within this distance.\n\nDefault: {DEFAULT_COMBINE_BREAK_MAX_DISTANCE:.0f} m",
+        )
+        st.session_state["CLIMB_MIN_DISTANCE_KM"] = st.number_input(
+            "Min climb length [km]",
+            min_value=0.1,
+            max_value=20.0,
+            value=float(DEFAULT_CLIMB_MIN_DISTANCE_KM),
+            step=0.1,
+            help=f"Minimum distance for a climb segment to be detected.\n\nDefault: {DEFAULT_CLIMB_MIN_DISTANCE_KM:.1f} km",
+        )
+        st.session_state["CLIMB_MIN_ELEVATION_GAIN_M"] = st.number_input(
+            "Min alt gain in climb [m]",
+            min_value=0.1,
+            max_value=2000.0,
+            value=float(DEFAULT_CLIMB_MIN_ELEVATION_GAIN_M),
+            step=0.1,
+            help=f"Minimum elevation gain for a segment to qualify as a climb.\n\nDefault: {DEFAULT_CLIMB_MIN_ELEVATION_GAIN_M:.1f} m",
+        )
+        st.session_state["CLIMB_END_AVERAGE_GRADE_PCT"] = st.number_input(
+            "Max grade at climb end [%]",
+            min_value=0.0,
+            max_value=float(MAX_GRADE),
+            value=float(DEFAULT_CLIMB_END_AVERAGE_GRADE_PCT),
+            step=0.1,
+            help=f"Climb end criterion: if average grade falls below this, climb may end.\n\nDefault: {DEFAULT_CLIMB_END_AVERAGE_GRADE_PCT:.1f} %",
+        )
+        st.session_state["CLIMB_END_WINDOW_SIZE_M"] = st.number_input(
+            "Climb end detection window [m]",
+            min_value=1.0,
+            max_value=1000.0,
+            value=float(DEFAULT_CLIMB_END_WINDOW_SIZE_M),
+            step=1.0,
+            help=f"Window length used to evaluate the climb end criterion.\n\nDefault: {DEFAULT_CLIMB_END_WINDOW_SIZE_M:.0f} m",
+        )
+        st.session_state["MAX_DIST_BETWEEN_CLIMBS_M"] = st.number_input(
+            "Combine Climbs within [m]",
+            min_value=1.0,
+            max_value=1000.0,
+            value=float(DEFAULT_MAX_DIST_BETWEEN_CLIMBS_M),
+            step=1.0,
+            help=f"Merge climbs separated by less than this distance.\n\nDefault: {DEFAULT_MAX_DIST_BETWEEN_CLIMBS_M:.0f} m",
+        )
+
+    with st.expander("Simulation", expanded=False):
+        st.session_state["HYSTERESIS_REAR_RPM"] = st.number_input(
+            "Allowable Cadence Error",
+            min_value=1.0,
+            max_value=60.0,
+            value=float(DEFAULT_HYSTERESIS_REAR_RPM),
+            step=1.0,
+            help=f"Cadence tolerance band (hysteresis) used in gear selection/shift logic.\n\nDefault: {DEFAULT_HYSTERESIS_REAR_RPM:.0f} RPM",
+        )
+        st.session_state["MIN_SHIFT_INTERVAL_REAR_SEC"] = st.number_input(
+            "Max. time between shifts",
+            min_value=1.0,
+            max_value=10000.0,
+            value=float(DEFAULT_MIN_SHIFT_INTERVAL_REAR_SEC),
+            step=1.0,
+            help=f"Minimum time between rear shifts to avoid rapid oscillation.\n\nDefault: {DEFAULT_MIN_SHIFT_INTERVAL_REAR_SEC:.0f} s",
+        )
+
+    with st.expander("Human Body Model", expanded=False):
+        st.session_state["EFFICIENCY"] = st.number_input(
+            "Human Body Efficiency [-]",
+            min_value=0.05,
+            max_value=0.4,
+            value=float(DEFAULT_HUMAN_BODY_EFFICIENCY),
+            step=0.01,
+            format="%.3f",
+            help=f"Gross mechanical efficiency (mechanical power / metabolic power).\n\nDefault: {DEFAULT_HUMAN_BODY_EFFICIENCY:.3f} [-]",
+        )
+        st.session_state["BASE_MET_DURING_ACTIVITY"] = st.number_input(
+            "Base MET [-]",
+            min_value=1.0,
+            max_value=2.0,
+            value=float(DEFAULT_BASE_MET_DURING_ACTIVITY),
+            step=0.05,
+            format="%.2f",
+            help=f"Baseline MET during activity (used in the metabolic model).\n\nDefault: {DEFAULT_BASE_MET_DURING_ACTIVITY:.2f} [-]",
+        )
+
     with st.expander("Advanced settings", expanded=False):
-        # These are used mostly as “global filters” or in your models.
-        # Store them in session_state so plots can reference them.
-        st.session_state["efficiency"] = st.number_input("Efficiency [-]", min_value=0.05, max_value=0.4, value=0.23, step=0.01, format="%.3f")
-        st.session_state["base_met"] = st.number_input("MET during breaks [-]", min_value=1.0, max_value=2.0, value=1.2, step=0.05, format="%.2f")
+        st.session_state["long_break_threshold_min"] = st.number_input(
+            "Long break threshold [min]",
+            min_value=1.0,
+            max_value=180.0,
+            value=10.0,
+            step=0.5,
+            help="Breaks longer than this are classified as 'long'.\n\nDefault: 10.0 min",
+        )
 
-        st.session_state["ref_cda"] = st.number_input("Reference CdA [m²]", min_value=0.1, max_value=1.5, value=0.324, step=0.01, format="%.4f")
-        st.session_state["ref_height_for_cda"] = st.number_input("Reference height for CdA [m]", min_value=1.0, max_value=2.5, value=1.80, step=0.01, format="%.2f")
+        st.session_state["wheel_circ"] = st.number_input(
+            "Wheel circumference [m]",
+            min_value=1.5,
+            max_value=2.8,
+            value=2.096,
+            step=0.001,
+            format="%.3f",
+            help="Wheel circumference used to convert cadence ↔ speed for gearing.\n\nDefault: 2.096 m",
+        )
+        st.session_state["drivetrain_loss"] = st.number_input(
+            "Drivetrain loss [-]",
+            min_value=0.0,
+            max_value=0.2,
+            value=0.03,
+            step=0.005,
+            format="%.3f",
+            help="Fractional drivetrain loss (0.03 = 3%).\n\nDefault: 0.030 [-]",
+        )
 
-        st.session_state["max_speed"] = st.number_input("Max speed [km/h]", min_value=10.0, max_value=200.0, value=120.0, step=5.0)
-        st.session_state["max_grade"] = st.number_input("Max grade [%]", min_value=1.0, max_value=60.0, value=30.0, step=1.0)
-        st.session_state["max_pwr"] = st.number_input("Max power [W]", min_value=100.0, max_value=3000.0, value=1500.0, step=50.0)
+        st.session_state["REFERENCE_CDA_VALUE"] = st.number_input(
+            "Reference CdA [m²]",
+            min_value=0.1,
+            max_value=1.5,
+            value=float(DEFAULT_REFERENCE_CDA_VALUE),
+            step=0.01,
+            format="%.7f",
+            help=f"Reference CdA value used for aerodynamic drag.\n\nDefault: {DEFAULT_REFERENCE_CDA_VALUE:.7f} m²",
+        )
 
-        st.session_state["min_active_speed"] = st.number_input("Min active speed [km/h]", min_value=0.0, max_value=20.0, value=0.5, step=0.1)
-        st.session_state["min_valid_speed"] = st.number_input("Min valid speed [km/h]", min_value=0.0, max_value=20.0, value=0.2, step=0.1)
+        st.session_state["MAX_MAP_POINTS"] = st.number_input(
+            "Max map points",
+            min_value=100,
+            max_value=200000,
+            value=int(DEFAULT_MAX_MAP_POINTS),
+            step=1000,
+            help=f"Subsample limit for map drawing to keep Folium responsive.\n\nDefault: {DEFAULT_MAX_MAP_POINTS:d}",
+        )
+        st.session_state["SMOOTHING_WINDOW_SIZE_S"] = st.number_input(
+            "Smoothing window [s]",
+            min_value=1.0,
+            max_value=20.0,
+            value=float(DEFAULT_SMOOTHING_WINDOW_SIZE_S),
+            step=1.0,
+            help=f"Smoothing window length for speed/grade/altitude filtering.\n\nDefault: {DEFAULT_SMOOTHING_WINDOW_SIZE_S:.1f} s",
+        )
 
-        st.session_state["max_map_points"] = st.number_input("Max map points", min_value=100, max_value=200000, value=20000, step=1000)
-        st.session_state["smoothing_window_s"] = st.number_input("Smoothing window [s]", min_value=1, max_value=10, value=3, step=1)
+        st.session_state["BRAKE_ADD_COOLING_FACTOR"] = st.number_input(
+            "Brake cooling factor [-]",
+            min_value=0.0,
+            max_value=5.0,
+            value=float(DEFAULT_BRAKE_ADD_COOLING_FACTOR),
+            step=0.025,
+            format="%.3f",
+            help=f"Additional cooling multiplier for the brake thermal model.\n\nDefault: {DEFAULT_BRAKE_ADD_COOLING_FACTOR:.3f} [-]",
+        )
+        st.session_state["BRAKE_PERFORATION_FACTOR"] = st.number_input(
+            "Brake perforation factor [-]",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(DEFAULT_BRAKE_PERFORATION_FACTOR),
+            step=0.025,
+            format="%.3f",
+            help=f"Perforation/ventilation factor for rotor cooling.\n\nDefault: {DEFAULT_BRAKE_PERFORATION_FACTOR:.3f} [-]",
+        )
+        st.session_state["BRAKE_DISTRIBUTION_FRONT"] = st.number_input(
+            "Front brake power distribution [-]",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(DEFAULT_BRAKE_DISTRIBUTION_FRONT),
+            step=0.025,
+            format="%.3f",
+            help=f"Fraction of braking power assumed on the front brake.\n\nDefault: {DEFAULT_BRAKE_DISTRIBUTION_FRONT:.3f} [-]",
+        )
 
-        # brake-related “globals” (kept for parity; use in your model as needed)
-        st.session_state["brake_front_dia_mm"] = st.number_input("Front brake dia [mm]", min_value=100.0, max_value=300.0, value=160.0, step=1.0)
-        st.session_state["brake_rear_dia_mm"] = st.number_input("Rear brake dia [mm]", min_value=80.0, max_value=300.0, value=160.0, step=1.0)
-        st.session_state["brake_cooling"] = st.number_input("Brake cooling factor [-]", min_value=0.0, max_value=5.0, value=1.0, step=0.025, format="%.3f")
-        st.session_state["brake_perforation"] = st.number_input("Brake perforation factor [-]", min_value=0.0, max_value=1.0, value=0.3, step=0.025, format="%.3f")
-        st.session_state["brake_dist_front"] = st.number_input("Front brake power distribution [-]", min_value=0.0, max_value=1.0, value=0.7, step=0.025, format="%.3f")
 
-        st.session_state["gravity"] = st.number_input("Gravity [m/s²]", min_value=9.0, max_value=10.0, value=9.81, step=0.0001, format="%.4f")
-
-        if st.button("Apply advanced settings"):
-            apply_advanced_globals(st.session_state)
-            log("Advanced settings applied.")
 
 # ---------------- Upload + analyze ----------------
 col_u1, col_u2 = st.columns([2, 3], vertical_alignment="top")
@@ -3874,7 +4463,6 @@ with col_u1:
             st.session_state.do_analyze_now = False
 
             cfg = build_config_from_ui(st.session_state)
-            apply_advanced_globals(st.session_state)
 
             prog = st.progress(0.0, text="Analyzing...")
             n_total = max(1, len(analyze_keys))
@@ -4038,20 +4626,40 @@ if key and key in st.session_state["results"]:
         st.plotly_chart(fig, use_container_width=True)
 
     with tabs[7]:
-        mode = st.selectbox(
-            "Color by",
-            [
-                "Speed [km/h]",
-                "Power [W]",
-                "Grade [%]",
-                "Headwind [m/s]",
-                "Air density [kg/m³]",
-                "Cadence [RPM]",
-                "Climbs (segments)",
-                "None (single color)",
-            ],
-            index=0
-        )
+        c1_map, c2_map, c3_map = st.columns(3)
+
+        with c1_map:
+            mode = st.selectbox(
+                "Color by",
+                [
+                    "Speed [km/h]",
+                    "Power [W]",
+                    "Grade [%]",
+                    "Headwind [m/s]",
+                    "Air density [kg/m³]",
+                    "Cadence [RPM]",
+                    "Climbs (segments)",
+                    "None (single color)",
+                ],
+                index=0
+            )
+
+        with c2_map:
+            st.session_state["marker_spacing_km"] = st.number_input(
+                "Map markers every [km]",
+                min_value=0.5,
+                max_value=1000.0,
+                value=5.0,
+                step=0.5,
+                help="Distance between red distance markers on the map.\n\nDefault: 5.0 km",
+            )
+
+        with c3_map:
+            SEGMENT_MEAN_MODE = st.checkbox(
+                "Display mean values between markers",
+                value=SEGMENT_MEAN_MODE,
+                #help="If enabled, use Meteostat weather. If disabled, use the ambient overrides below.\n\nDefault: off",
+            )
 
         m, values_full, caption = build_map(
             result,
@@ -4065,28 +4673,18 @@ if key and key in st.session_state["results"]:
         else:
             # distance slider replacing hover-sync
             d_full = np.asarray(result["filtered_dists"], dtype=float)
-            idx = 0
-            if d_full.size > 1:
-                idx = st.slider("Cursor (index)", min_value=0, max_value=int(d_full.size - 1), value=0, step=1)
-                lat = float(np.asarray(result["filtered_lats"], dtype=float)[idx])
-                lon = float(np.asarray(result["filtered_lons"], dtype=float)[idx])
-                folium.CircleMarker([lat, lon], radius=6, color="black", fill=True, fill_opacity=0.9).add_to(m)
-
             # render map
-            if False:#st_folium is not None:
-                st_folium(m, use_container_width=True, height=500)
-            else:
-                # fallback: save HTML and embed
-                html = m.get_root().render()
-                st.components.v1.html(html, height=550, scrolling=True)
+            html = m.get_root().render()
+            st.components.v1.html(html, height=850, scrolling=True)
 
             # metric plot under map
             fig = plot_cmap_metric(
                 result,
                 y_label=caption if caption else mode,
                 values_full=values_full,
-                cursor_idx=idx,
+                cursor_idx=None,
                 spacing_km=float(st.session_state["marker_spacing_km"]),
+                segment_mean_mode=SEGMENT_MEAN_MODE
             )
             st.plotly_chart(fig, use_container_width=True)
 
