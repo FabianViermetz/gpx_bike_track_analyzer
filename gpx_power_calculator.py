@@ -3626,9 +3626,8 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
         values_full = segment_mean_by_distance(d_full, values_full, float(marker_spacing_km))
 
     # subsample for performance (drawing only)
-    max_map_points = int(st.session_state["max_map_points"])
     n = len(lats_full)
-    idx = np.linspace(0, n - 1, max_map_points, dtype=int) if n > max_map_points else np.arange(n, dtype=int)
+    idx = np.linspace(0, n - 1, MAX_MAP_POINTS, dtype=int) if n > MAX_MAP_POINTS else np.arange(n, dtype=int)
 
     lats = lats_full[idx]
     lons = lons_full[idx]
