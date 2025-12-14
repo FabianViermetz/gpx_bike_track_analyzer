@@ -1545,19 +1545,21 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
     cut_beginning = 0
     cut_end = 0
     # store both for later use
-    times = times_local_display if FIX_TIME_ZONE else None
+    # times = times_local_display if FIX_TIME_ZONE else None
     lats = lats[cut_beginning:cut_end-1]
     lons = lons[cut_beginning:cut_end-1]
     raw_alts = raw_alts[cut_beginning:cut_end-1]
     times = times[cut_beginning:cut_end-1]
+    times_local_display = times_local_display[cut_beginning:cut_end-1]
     hr_raw = hr_raw[cut_beginning:cut_end-1]
     cad_raw = cad_raw[cut_beginning:cut_end-1]
     pwr_raw = pwr_raw[cut_beginning:cut_end-1]
     temp_dev_raw = temp_dev_raw[cut_beginning:cut_end-1]
     speeds = speeds[cut_beginning:cut_end-1]
     dists = dists[cut_beginning:cut_end-1]
-
     
+
+
     if len(times) == 0:
         raise ValueError("No time data found in GPX file.")
 
@@ -1628,6 +1630,7 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
         "start_time": start_time,
         "end_time": end_time,
         "timestep_min": timestep_min,
+        "times_local_display": times_local_display,
     }
 
 
@@ -2545,6 +2548,8 @@ def analyze_gpx_file(
 
     # 1) Parse + interpolate core time series
     core = _parse_and_interpolate_gpx(gpx_path, progress_cb=_report)
+    local_start_time = core["times_local_display"][0]
+    local_end_time = core["times_local_display"][-1]
     start_time = core["start_time"]
     end_time = core["end_time"]
     timestep_min = core["timestep_min"]
@@ -2753,6 +2758,8 @@ def analyze_gpx_file(
 
     # Final result dict (same keys as before, just filled from substeps)
     result = {
+        "local_start_time": local_start_time,
+        "local_end_time": local_end_time,
         "gpx_path": gpx_path,
         "timestep_min": timestep_min,
         "filtered_times": filtered["filtered_times"],
@@ -4118,7 +4125,7 @@ with st.sidebar:
         # --- Ambient / environment overrides (manual) ---
         st.session_state["use_wind"] = st.checkbox(
             "Use weather data (Meteostat)",
-            value=False,
+            value=True,
             help="If enabled, use Meteostat weather. If disabled, use the ambient overrides below.\n\nDefault: off",
         )
 
@@ -4578,10 +4585,13 @@ if key and key in st.session_state["results"]:
     kcal_base = float(np.asarray(result.get("cum_kcal_base", [0]))[-1])
     kcal_total = float(np.asarray(result.get("cum_kcal_total", [0]))[-1])
 
+    start_local = result.get("local_start_time")
+    end_local = result.get("local_end_time")
+
     with c1:
-        st.metric("Date", start.strftime("%Y-%m-%d") if start else "-")
-        st.metric("Start", start.strftime("%H:%M:%S") if start else "-")
-        st.metric("End", end.strftime("%H:%M:%S") if end else "-")
+        st.metric("Date", start_local.strftime("%Y-%m-%d") if start else "-")
+        st.metric("Start", start_local.strftime("%H:%M:%S") if start else "-")
+        st.metric("End", end_local.strftime("%H:%M:%S") if end else "-")
     with c2:
         st.metric("Distance", f"{dist:.1f} km")
         st.metric("Duration (moving)", f"{time_to_readable(t_minutes=total_dur)}")
