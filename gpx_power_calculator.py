@@ -2982,12 +2982,16 @@ def log(msg: str):
     st.session_state["log_lines"].append(str(msg))
 
 
+def print(str_):
+    details_lines.append(str(str_))
+
 def render_log():
     lines = st.session_state.get("log_lines", [])
     if not lines:
         st.info("Log is empty.")
         return
     st.code("\n".join(lines[-400:]), language="text")
+
 
 
 # =============================================================================
@@ -3970,6 +3974,7 @@ st.set_page_config(page_title="GPX Bike Tour Analyzer", layout="wide")
 # Run-control state (prevents re-analysis on widget changes)
 # =============================================================================
 st.session_state.setdefault("results", {})         # key -> result dict
+st.session_state.setdefault("details", {})         # key -> details dict
 st.session_state.setdefault("order", [])           # upload order
 st.session_state.setdefault("selected_key", None)  # current selection
 
@@ -3988,6 +3993,7 @@ st.title("GPX Bike Tour Analyzer")
 
 # Initialize session stores
 st.session_state.setdefault("results", {})         # key -> result dict
+st.session_state.setdefault("details", {})         # key -> details dict
 st.session_state.setdefault("order", [])           # upload order
 st.session_state.setdefault("selected_key", None)  # current selection
 
@@ -4495,6 +4501,8 @@ with col_u1:
                     )
                     if result is not None:
                         st.session_state["results"][key] = result
+                        st.session_state["details"][key] = details_lines
+                        details_lines = []
                         st.session_state["selected_key"] = key
                         log(f"Done: {key}")
                     else:
@@ -4554,7 +4562,7 @@ with col_u2:
 key = st.session_state.get("selected_key", None)
 if key and key in st.session_state["results"]:
     result = st.session_state["results"][key]
-
+    details = st.session_state["details"][key]
     # top “Track Info” block
     st.subheader("Track Info")
     c1, c2, c3, c4 = st.columns(4)
@@ -4714,7 +4722,9 @@ if key and key in st.session_state["results"]:
         #             f"{c.get('average_grade_pct',0):.1f} %, dur {c.get('duration_min',0):.1f} min, "
         #             f"VAM {c.get('vam_m_per_h',0):.0f} m/h, P_avg {c.get('avg_power_w',0):.0f} W"
         #         )
-        st.code("\n".join(details_lines), language="text")
+        # st.code("\n".join(details_lines), language="text")
+        st.code("\n".join(details), language="text")
+       
         
 
     with tabs[9]:
