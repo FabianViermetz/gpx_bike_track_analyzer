@@ -3197,7 +3197,7 @@ def plot_profiles(result, highlight_climbs=False):
     fig.update_yaxes(title_text="ρ [kg/m³]", row=4, col=1, secondary_y=True)
     fig.update_xaxes(title_text="Distance [km]", row=4, col=1)
 
-    fig.update_layout(height=850, margin=dict(l=30, r=20, t=40, b=30), legend=dict(orientation="h"))
+    fig.update_layout(height=1500, margin=dict(l=30, r=20, t=40, b=30), legend=dict(orientation="h"))
 
     if highlight_climbs:
         _add_ride_type_shading(fig, d, ride_type)
@@ -3274,7 +3274,7 @@ def plot_distributions(result, max_speed=120.0, max_pwr=1500.0):
         fig.update_xaxes(tickangle=90, row=2, col=2)
         fig.update_yaxes(title_text="Time [min]", row=2, col=2)
 
-    fig.update_layout(height=750, margin=dict(l=30, r=20, t=50, b=30), showlegend=False)
+    fig.update_layout(height=1500, margin=dict(l=30, r=20, t=50, b=30), showlegend=False)
     return fig
 
 
@@ -3363,7 +3363,7 @@ def plot_segments(result):
         title="5 km segments – Power Components",
         xaxis_title="5 km segments",
         yaxis_title="Average power [W]",
-        height=520,
+        height=1500,
         margin=dict(l=30, r=20, t=60, b=120),
         legend=dict(orientation="h"),
     )
@@ -3547,7 +3547,7 @@ def plot_human(result):
 
     # Cosmetics
     fig.update_layout(
-        height=900,
+        height=1500,
         margin=dict(l=30, r=20, t=50, b=30),
         legend=dict(orientation="h"),
     )
@@ -3590,7 +3590,7 @@ def plot_environment(result):
     fig.update_xaxes(title_text="Distance [km]", row=3, col=1)
     fig.update_xaxes(title_text="Distance [km]", row=3, col=2)
 
-    fig.update_layout(height=750, margin=dict(l=30, r=20, t=50, b=30), showlegend=False)
+    fig.update_layout(height=1500, margin=dict(l=30, r=20, t=50, b=30), showlegend=False)
     return fig
 
 
