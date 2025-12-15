@@ -199,3 +199,5 @@ correctness or fitness for a particular purpose.
 Author
 
 Fabian Viermetz
+
+readme created by chatgpt. It is not comprehensive.
