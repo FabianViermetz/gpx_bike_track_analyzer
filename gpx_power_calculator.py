@@ -127,7 +127,10 @@ class RiderBikeConfig:
     draft_effect_uh: float       # dimensionless multiplier (<1 when drafting)
     tire_weight_g: float       
     tube_weight_g: float       
-    rim_weight_g: float       
+    rim_weight_g: float
+    sim_power_W: float
+    sim_max_downhill_kph: float
+    sim_breaks_min_per_h: float
 
     @property
     def mass(self) -> float:
@@ -1761,8 +1764,9 @@ def _weather_and_air_density(core, use_wind_data, progress_cb=None):
     return weather
 
 
-def _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_cb=None):
+def _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_cb=None, simulate=False):
     """Compute headwind, acceleration, power, smoothed power, and brake power."""
+
     def _report(pct, text):
         if progress_cb is not None:
             progress_cb(int(pct), text)
@@ -1811,10 +1815,202 @@ def _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_c
 
     smoothed_headwinds = moving_average(headwinds, window_size=SMOOTHING_WINDOW_SIZE_S)
 
+    # =========================
+    # SIMULATE NEW TIMESTAMPS
+    # =========================
+    if simulate:
+        # user-configurable knobs (put them into cfg if you prefer)
+        P_TARGET_W = cfg.sim_power_W
+        VMAX_DOWNHILL_KPH = cfg.sim_max_downhill_kph
+        VMAX_DOWNHILL_MS = VMAX_DOWNHILL_KPH / 3.6
+
+        A_LAT_MAX = 1.5          # m/s², ~1.5–3.0 typical
+        TURN_MIN_DS = 5.0    # ignore tiny segments
+        TURN_MIN_DPSI_DEG = 6.0  # ignore tiny direction noise
+
+        V_MIN_MS = 0.5          # avoid dt explosions at near-zero speed
+        V_SEARCH_MAX_MS = 40.0  # 144 km/h search ceiling for solving P(v)=P_TARGET
+
+        n = len(lats)
+
+        def _wrap_deg180(a):
+            return (a + 180.0) % 360.0 - 180.0
+
+        # 1) distances between points (meters)
+        ds = [0.0] * n
+        for i in range(1, n):
+            ds[i] = geodesic((lats[i-1], lons[i-1]), (lats[i], lons[i])).meters
+
+        bearings_deg = [0.0] * n
+        for i in range(1, n):
+            bearings_deg[i-1] = compute_bearing(lats[i-1], lons[i-1], lats[i], lons[i])
+        bearings_deg[-1] = bearings_deg[-2] if n > 1 else 0.0
+
+
+        # 2) solve speed per point from power model (quasi-steady: acceleration=0)
+        def _power_at_v(v_ms, i):
+            p, *_ = compute_power(
+                v_ms,
+                (v_ms-sim_speeds_ms[-1]),  # quasi-steady
+                smoothed_grades[i],
+                smoothed_headwinds[i],
+                cfg,
+                rho_series[i],
+                ride_type_series[i],
+            )
+            return float(p)
+        
+
+        def _solve_v_for_power(i):
+            # Binary-search for v where power ~= P_TARGET_W.
+            # We bracket by increasing high until power(high) >= target.
+            lo = 0.0
+            hi = 2.0
+            p_hi = _power_at_v(hi, i)
+
+            while hi < V_SEARCH_MAX_MS and p_hi < P_TARGET_W:
+                hi *= 1.5
+                p_hi = _power_at_v(hi, i)
+
+            # If even at hi we don't reach target, just return hi (rare, but safe)
+            if p_hi < P_TARGET_W:
+                return min(hi, V_SEARCH_MAX_MS)
+
+            # standard binary search
+            for _ in range(40):
+                mid = 0.5 * (lo + hi)
+                p_mid = _power_at_v(mid, i)
+                if p_mid < P_TARGET_W:
+                    lo = mid
+                else:
+                    hi = mid
+            return max(hi, V_MIN_MS)
+
+        sim_speeds_ms = [max(smoothed_speeds_ms[0], V_MIN_MS)]
+        for i in range(1, n):
+            v = _solve_v_for_power(i)
+
+            # downhill speed cap
+            if smoothed_grades[i] < 0.0:
+                v = min(v, VMAX_DOWNHILL_MS)
+
+            # ---- NEW: turn-based cap from bearing change ----
+            if i >= 2 and ds[i] >= TURN_MIN_DS:
+                dpsi_deg = abs(_wrap_deg180(bearings_deg[i] - bearings_deg[i-1]))
+                if dpsi_deg >= TURN_MIN_DPSI_DEG:
+                    dpsi = math.radians(dpsi_deg)
+                    # radius ~ ds/dpsi, vcap = sqrt(a_lat_max * R)
+                    v_turn_cap = math.sqrt(A_LAT_MAX * (ds[i] / max(dpsi, 1e-6)))
+                    v = min(v, v_turn_cap)
+
+            sim_speeds_ms.append(max(v, V_MIN_MS))
+
+
+        tau_s = SMOOTHING_WINDOW_SIZE_S  # 3–10 s typical
+        sim_speeds_ms_smooth = [sim_speeds_ms[0]]
+        for i in range(1, n):
+            dt0 = (times[i].timestamp() - times[i-1].timestamp())
+            dt0 = max(dt0, 1.0)  # fallback
+            alpha = dt0 / (tau_s + dt0)
+            sim_speeds_ms_smooth.append(
+                sim_speeds_ms_smooth[-1] + alpha * (sim_speeds_ms[i] - sim_speeds_ms_smooth[-1])
+            )
+        sim_speeds_ms = sim_speeds_ms_smooth
+        # 3) integrate new timestamps
+        t0 = times[0]
+        new_times = [t0]
+        for i in range(1, n):
+            v = sim_speeds_ms[i]
+            dt = ds[i] / v if v > 0 else 0.0
+            new_times.append(new_times[-1] + timedelta(seconds=float(dt)))
+
+        # 3.9) add breaks per hour (single discrete break after each 1h riding)
+        breaks_min_per_h = cfg.sim_breaks_min_per_h
+        break_s = breaks_min_per_h * 60.0
+
+        t0 = times[0]
+        new_times = [t0]
+
+        ride_acc_s = 0.0  # accumulated riding time since last break (seconds)
+
+        for i in range(1, n):
+            v = float(sim_speeds_ms[i])
+            dt_ride = (ds[i] / v) if v > 1e-9 else 0.0  # riding time for this segment
+
+            # Apply as many breaks as we cross within this segment (rare but possible on long segments)
+            remaining = dt_ride
+            t = new_times[-1]
+
+            while remaining > 0.0:
+                to_next_break = 3600.0 - ride_acc_s  # riding seconds until break triggers
+
+                if remaining < to_next_break:
+                    # no break within this segment
+                    t = t + timedelta(seconds=float(remaining))
+                    ride_acc_s += remaining
+                    remaining = 0.0
+                else:
+                    # reach the break point inside this segment
+                    t = t + timedelta(seconds=float(to_next_break))
+                    remaining -= to_next_break
+
+                    # insert break
+                    if break_s > 0.0:
+                        t = t + timedelta(seconds=float(break_s))
+
+                    # reset riding accumulator after the break
+                    ride_acc_s = 0.0
+
+            new_times.append(t)
+
+
+        # 4) override core times (and optionally smooth speeds)
+        core = dict(core)
+        smooth = dict(smooth)
+        core["times"] = np.asarray(new_times, dtype=object)
+        old_local0 = core["times_local_display"][0] if ("times_local_display" in core and len(core["times_local_display"]) > 0) else None
+
+        # start/end in UTC
+        t_arr = core["times"]
+        core["start_time"] = t_arr[0] if len(t_arr) else None
+        core["end_time"]   = t_arr[-1] if len(t_arr) else None
+
+        # local display: local start + simulated elapsed time
+        if old_local0 is not None and len(t_arr) > 0:
+            t0 = t_arr[0]
+            core["times_local_display"] = np.asarray([old_local0 + (t - t0) for t in t_arr], dtype=object)
+        else:
+            # fallback: just show UTC
+            core["times_local_display"] = np.asarray(list(t_arr), dtype=object)
+
+        # If you want the rest of the pipeline to “live” in the simulated world:
+        smooth["smoothed_speeds_ms"] = np.array(sim_speeds_ms, dtype=float)
+        smooth["smoothed_speeds_kph"] = np.array(sim_speeds_ms, dtype=float) * 3.6
+
+        # IMPORTANT: now that speeds/times changed, accelerations should be recomputed below.
+        # We’ll recompute accelerations from these simulated speeds + new times:
+        smoothed_speeds_ms = smooth["smoothed_speeds_ms"]
+        smoothed_speeds_kph = smooth["smoothed_speeds_kph"]
+        times = core["times"]
+
+        headwinds = headwinds  # bearing-based; keep as-is
+        accelerations = [0.0]
+        for i in range(1, len(smoothed_speeds_ms)):
+            dv = float(smoothed_speeds_ms[i] - smoothed_speeds_ms[i - 1])
+            dt = times[i].timestamp() - times[i - 1].timestamp()
+            accelerations.append(dv / dt if dt > 0 else 0.0)
+
+        accelerations = np.array(accelerations, dtype=float)
+        smoothed_headwinds = np.array(smoothed_headwinds, dtype=float)
+
+    # ----- continue as before -----
+    powers = []
+    powers_details = {"slope": [], "roll": [], "drag": [], "acc": [], "pt": []}
+
     for i in range(1, len(smoothed_speeds_ms)):
         p, p_g, p_r, p_d, p_a, p_pt = compute_power(
             smoothed_speeds_ms[i],
-            accelerations[i],
+            float(accelerations[i]),
             smoothed_grades[i],
             smoothed_headwinds[i],
             cfg,
@@ -1844,16 +2040,16 @@ def _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_c
 
     smoothed_powers_details = {
         "slope": moving_average(powers_details["slope"], window_size=SMOOTHING_WINDOW_SIZE_S),
-        "roll": moving_average(powers_details["roll"], window_size=SMOOTHING_WINDOW_SIZE_S),
-        "drag": moving_average(powers_details["drag"], window_size=SMOOTHING_WINDOW_SIZE_S),
-        "acc": moving_average(powers_details["acc"], window_size=SMOOTHING_WINDOW_SIZE_S),
-        "pt": moving_average(powers_details["pt"], window_size=SMOOTHING_WINDOW_SIZE_S),
+        "roll":  moving_average(powers_details["roll"],  window_size=SMOOTHING_WINDOW_SIZE_S),
+        "drag":  moving_average(powers_details["drag"],  window_size=SMOOTHING_WINDOW_SIZE_S),
+        "acc":   moving_average(powers_details["acc"],   window_size=SMOOTHING_WINDOW_SIZE_S),
+        "pt":    moving_average(powers_details["pt"],    window_size=SMOOTHING_WINDOW_SIZE_S),
     }
 
     smoothed_decel_powers = np.clip(smoothed_powers_details["acc"], None, 0.0)
     smoothed_brake_powers = np.clip(smoothed_powers, None, 0.0)
 
-    return {
+    out = {
         "headwinds": np.array(headwinds),
         "accelerations": np.array(accelerations),
         "smoothed_headwinds": np.array(smoothed_headwinds),
@@ -1864,6 +2060,7 @@ def _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_c
         "smoothed_decel_powers": np.array(smoothed_decel_powers),
         "smoothed_brake_powers": np.array(smoothed_brake_powers),
     }
+    return out, core, smooth
 
 
 def _filter_and_disk_temp(core, smooth, ride_type_series, power_data, weather, progress_cb=None):
@@ -2036,14 +2233,58 @@ def _compute_kcal_timeseries(filtered_times, filtered_powers, timestep_min, cfg)
     }
 
 
-def _detect_breaks(smoothed_speeds_kph, times, total_dists, timestep_min, break_threshold_min):
-    """Detect short and long breaks based on speed threshold."""
-    is_stopped = smoothed_speeds_kph <= MIN_ACTIVE_SPEED
-    breaks = []
-    n = len(is_stopped)
-    i = 0
+def _detect_breaks(smoothed_speeds_kph, times, total_dists, timestep_min, break_threshold_min, simulate=False):
+    """Detect short and long breaks.
+    - simulate=False: use speed threshold (legacy logic).
+    - simulate=True: detect breaks from time gaps (robust for simulated breaks).
+    """
     MIN_BREAK_DURATION_MIN = 0.5
+    breaks = []
 
+    n = min(len(times), len(total_dists), len(smoothed_speeds_kph))
+    if n < 2:
+        return breaks
+
+    if simulate:
+        # normal dt ~ 1s; breaks >= 60s => detect large gaps
+        # tune these if needed:
+        NORMAL_DT_S = max(0.2, float(timestep_min) * 60.0)   # expected base sampling
+        GAP_TRIGGER_S = max(30.0, 10.0 * NORMAL_DT_S)        # treat bigger gaps as breaks
+
+        for i in range(1, n):
+            dt_s = times[i].timestamp() - times[i - 1].timestamp()
+            if dt_s <= GAP_TRIGGER_S:
+                continue
+
+            duration_min = dt_s / 60.0
+            if duration_min < MIN_BREAK_DURATION_MIN:
+                continue
+
+            btype = "long" if duration_min >= break_threshold_min else "short"
+
+            # break occurs between i-1 and i
+            start_idx = i - 1
+            end_idx = i
+
+            breaks.append({
+                "start_idx": start_idx,
+                "end_idx": end_idx,
+                "start_time": times[start_idx],
+                "end_time": times[end_idx],
+                "duration_min": duration_min,
+                "type": btype,
+                "lat": None,
+                "lon": None,
+                # for simulated: time since start based on actual timestamps
+                "time_min": (times[start_idx].timestamp() - times[0].timestamp()) / 60.0,
+                "distance_km": float(total_dists[start_idx]) if start_idx < len(total_dists) else 0.0
+            })
+
+        return breaks
+
+    # ---------- legacy (real data) ----------
+    is_stopped = smoothed_speeds_kph[:n] <= MIN_ACTIVE_SPEED
+    i = 0
     while i < n:
         if not is_stopped[i]:
             i += 1
@@ -2056,25 +2297,21 @@ def _detect_breaks(smoothed_speeds_kph, times, total_dists, timestep_min, break_
         if duration_min < MIN_BREAK_DURATION_MIN:
             continue
         btype = "long" if duration_min >= break_threshold_min else "short"
-        start_time_break = times[start_idx]
-        end_time_break = times[end_idx]
-        lat_center = None
-        lon_center = None
-        # lat,lon not needed directly here; caller can add if wanted
         breaks.append({
             "start_idx": start_idx,
             "end_idx": end_idx,
-            "start_time": start_time_break,
-            "end_time": end_time_break,
+            "start_time": times[start_idx],
+            "end_time": times[end_idx],
             "duration_min": duration_min,
             "type": btype,
-            "lat": lat_center,
-            "lon": lon_center,
+            "lat": None,
+            "lon": None,
             "time_min": (start_idx * timestep_min),
             "distance_km": float(total_dists[start_idx]) if start_idx < len(total_dists) else 0.0
         })
 
     return breaks
+
 
 
 def _augment_break_positions(breaks, lats, lons):
@@ -2619,7 +2856,8 @@ def analyze_gpx_file(
     use_wind_data: bool = True,
     exclude_downhill_gears: bool = True,
     break_threshold_min: float = 10.0,
-    progress_cb=None
+    progress_cb=None,
+    simulate=False
 ):
     """
     Main analysis: orchestrates all steps and returns a big result dict.
@@ -2649,8 +2887,12 @@ def analyze_gpx_file(
     climbs, combined_climbs, downhills, combined_downhills, ride_type_series = _detect_climbs_and_downhills(smooth["smoothed_alts"], smooth["dists"], smooth["times"], smooth["total_dists"])
 
     # 4) Headwind & power components
-    power_data = _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_cb=_report)
+    power_data, core, smooth= _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_cb=_report,simulate=simulate)
 
+    local_start_time = core["times_local_display"][0]
+    local_end_time = core["times_local_display"][-1]
+    start_time = core["start_time"]
+    end_time = core["end_time"]
     # 5) Filter & brake temps
     filtered = _filter_and_disk_temp(core, smooth, ride_type_series, power_data, weather, progress_cb=_report)
 
@@ -2716,6 +2958,7 @@ def analyze_gpx_file(
         filtered["total_dists"],
         timestep_min,
         break_threshold_min,
+        simulate=simulate
     )
 
     _augment_break_positions(breaks, core["lats"], core["lons"])
@@ -2763,29 +3006,72 @@ def analyze_gpx_file(
     gear_sim = _gear_simulation(filtered, cfg, target_cadence, exclude_downhill_gears)
 
     # 12) Summary stats & console printouts
-    powers_arr = np.array(filtered["filtered_powers"])
-    active_mask = powers_arr > 0
-    total_duration_min = len(powers_arr) * timestep_min
-    active_duration_min = np.count_nonzero(active_mask) * timestep_min
-    pause_duration_min = total_duration_min - active_duration_min
+    powers_arr = np.asarray(filtered["filtered_powers"], dtype=float)
+    speeds_kph = np.asarray(filtered["filtered_speeds_kph"], dtype=float)  # make sure you have this in `filtered`
+    times_arr  = np.asarray(filtered["filtered_times"], dtype=object)
 
-    active_powers = powers_arr[active_mask]
-    avg_power_active = float(np.mean(active_powers)) if len(active_powers) > 0 else 0.0
+    n = min(len(powers_arr), len(times_arr), len(speeds_kph))
+    powers_arr = powers_arr[:n]
+    times_arr  = times_arr[:n]
+    speeds_kph = speeds_kph[:n]
 
-    work_joules = float(np.sum(active_powers) * timestep_min * 60.0)
+    if n < 2:
+        total_duration_min = moving_duration_min = pedaling_duration_min = pause_duration_min = 0.0
+        work_joules = 0.0
+        avg_power_active = avg_power_with_freewheeling = 0.0
+    else:
+        # raw dt per sample (interval i-1 -> i stored at i)
+        dt_raw = np.zeros(n, dtype=float)
+        for i in range(1, n):
+            dt_raw[i] = max(0.0, times_arr[i].timestamp() - times_arr[i-1].timestamp())
+
+        total_duration_min = float((times_arr[-1].timestamp() - times_arr[0].timestamp()) / 60.0)
+
+        # estimate nominal dt (ignore big gaps)
+        small = dt_raw[(dt_raw > 0) & (dt_raw < 10.0)]
+        dt_nom = float(np.median(small)) if small.size else 1.0
+
+        # Anything beyond dt_cap is treated as pause (your injected breaks)
+        dt_cap = float(max(1.0, 3.0 * dt_nom))  # tune: 2–5× if needed
+        dt_pause = np.clip(dt_raw - dt_cap, 0.0, None)
+        dt_move  = dt_raw - dt_pause  # moving+coasting+pedaling time only
+
+        pause_duration_min = float(np.sum(dt_pause) / 60.0)
+
+        # MOVING time: speed above threshold, using dt_move so breaks don't count as moving
+        moving_mask = speeds_kph > MIN_ACTIVE_SPEED
+        active_duration_min = float(np.sum(dt_move[moving_mask]) / 60.0)
+
+        # PEDALING time: power > 0, also only count dt_move
+        pedaling_mask = powers_arr > 0
+        pedaling_duration_min = float(np.sum(dt_move[pedaling_mask]) / 60.0)
+
+        # work and avg power should also use dt_move (not dt_raw)
+        active_dt = dt_move[pedaling_mask]
+        active_p  = powers_arr[pedaling_mask]
+
+        work_joules = float(np.sum(active_p * active_dt))
+
+        avg_power_active = float(np.sum(active_p * active_dt) / np.sum(active_dt)) if np.sum(active_dt) > 0 else 0.0
+
+        pos_p = np.clip(powers_arr, 0.0, None)
+        avg_power_with_freewheeling = float(np.sum(pos_p * dt_move) / np.sum(dt_move)) if np.sum(dt_move) > 0 else 0.0
+
     kcal_burned = work_joules / (EFFICIENCY * 4184.0) if EFFICIENCY > 0 else 0.0
-    met_active = (kcal_burned / cfg.body_mass / (active_duration_min / 60.0)
-                  if active_duration_min > 0 else 0.0)
-    avg_power_with_freewheeling = np.mean(np.clip(powers_arr, 0, None))
+    met_active = (kcal_burned / cfg.body_mass / (pedaling_duration_min / 60.0)
+                if pedaling_duration_min > 0 else 0.0)
+    
+    pause_duration_min = active_duration_min - pedaling_duration_min
 
     print("\n=== Ride Summary ===")
-    print(f"Total duration:      {total_duration_min:.1f} min")
-    print(f"Active duration:     {active_duration_min:.1f} min")
-    print(f"Pause duration:      {pause_duration_min:.1f} min")
-    print(f"Average pedaling power:       {avg_power_active:.1f} W (non-negative only)")
-    print(f"Average positive power:       {avg_power_with_freewheeling:.1f} W (including freewheeling only)")
-    print(f"Calories burned:     {kcal_burned:.0f} kcal (active)")
-    print(f"Estimated MET:       {met_active:.1f} (active)")
+    print(f"Total duration:              {total_duration_min:.1f} min")
+    print(f"Moving duration:             {active_duration_min:.1f} min")
+    print(f"Pedaling duration:           {pedaling_duration_min:.1f} min")
+    print(f"Freewheeling duration:       {pause_duration_min:.1f} min")
+    print(f"Average pedaling power:      {avg_power_active:.1f} W")
+    print(f"Average positive power:      {avg_power_with_freewheeling:.1f} W")
+    print(f"Calories burned:             {kcal_burned:.0f} kcal (active)")
+    print(f"Estimated MET:               {met_active:.1f} (active)")
 
     print("\n=== Gear Shifts ===")
     print(f"Front derailleur shifts: {gear_sim['front_shifts']}")
@@ -2918,6 +3204,7 @@ def analyze_gpx_file(
         # durations & energy
         "total_duration_min": total_duration_min,
         "active_duration_min": active_duration_min,
+        "pedaling_duration_min": pedaling_duration_min,
         "pause_duration_min": pause_duration_min,
         "avg_power_active": avg_power_active,
         "avg_power_with_freewheeling": avg_power_with_freewheeling,
@@ -3219,6 +3506,9 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
         rim_weight_g= float(state["RIM_WEIGHT"]),
         tire_weight_g= float(state["TIRE_WEIGHT"]),
         tube_weight_g= float(state["TUBE_WEIGHT"]),
+        sim_power_W=float(state["RIDER_POWER_SIM"]),
+        sim_max_downhill_kph=float(state["MAX_SPEED_SIM"]),
+        sim_breaks_min_per_h=float(state["BREAKS_MIN_PER_H"])
     )
 
 
@@ -4162,6 +4452,11 @@ with st.sidebar:
             value=False,
             help="If enabled, use the date and time overrides below.\n\nDefault: off",
         )
+        st.session_state["USE_DRIVER_SIMULATOR"] = st.checkbox(
+            "Simulate Rider",
+            value=False,
+            help="If enabled, Rider Average Power is used to simulate the ride.\n\nDefault: off",
+        )
         st.session_state["manual_date"]  = st.date_input(
             "Override Date",
             value=dt.date.today(),
@@ -4337,6 +4632,32 @@ with st.sidebar:
                 "Tire Weight (used by the inertia model).\n\n"
                 f"Default: {DEFAULT_TIRE_WEIGHT_G:.1f} W"
             ),
+        )
+
+    with st.expander("Rider Simulation", expanded=False):
+        st.session_state["RIDER_POWER_SIM"] = st.number_input(
+            "Rider Power [W]",
+            min_value=1.0,
+            max_value=500.0,
+            value=125.0,
+            step=1.,
+            help="Average Rider Power. Only used Simulate Rider is on.\n\nDefault: 125.0 W",
+        )
+        st.session_state["MAX_SPEED_SIM"] = st.number_input(
+            "Rider max Speed [km/h]",
+            min_value=1.0,
+            max_value=300.0,
+            value=60.0,
+            step=1.,
+            help="Max Rider Speed. Only used Simulate Rider is on.\n\nDefault: 60.0 km/h",
+        )
+        st.session_state["BREAKS_MIN_PER_H"] = st.number_input(
+            "Breaks per Hour [min]",
+            min_value=0.0,
+            max_value=300.0,
+            value=10.0,
+            step=1.,
+            help="Additional Breaks per Hour Cycling.\n\nDefault: 10.0 min",
         )
 
     with st.expander("Environment", expanded=False):
@@ -4699,31 +5020,28 @@ with col_u1:
                     tf.write(gpx_bytes)
                     tmp_path = tf.name
 
-                try:
-                    log(f"Analyzing: {key}")
-                    result = analyze_gpx_file(
-                        tmp_path,
-                        cfg=cfg,
-                        target_cadence=int(st.session_state["target_cadence"]),
-                        use_wind_data=bool(st.session_state["use_wind"]),
-                        break_threshold_min=float(st.session_state["long_break_threshold_min"]),
-                        progress_cb=None,
-                    )
-                    if result is not None:
-                        st.session_state["results"][key] = result
-                        st.session_state["details"][key] = details_lines
-                        details_lines = []
-                        st.session_state["selected_key"] = key
-                        log(f"Done: {key}")
-                    else:
-                        log(f"Analyzer returned None: {key}")
+                log(f"Analyzing: {key}")
+                result = analyze_gpx_file(
+                    tmp_path,
+                    cfg=cfg,
+                    target_cadence=int(st.session_state["target_cadence"]),
+                    use_wind_data=bool(st.session_state["use_wind"]),
+                    break_threshold_min=float(st.session_state["long_break_threshold_min"]),
+                    progress_cb=None,
+                    simulate=bool(st.session_state["USE_DRIVER_SIMULATOR"])
+                )
+                if result is not None:
+                    st.session_state["results"][key] = result
+                    st.session_state["details"][key] = details_lines
+                    details_lines = []
+                    st.session_state["selected_key"] = key
+                    log(f"Done: {key}")
+                else:
+                    log(f"Analyzer returned None: {key}")
+                        
 
-                except Exception as e:
-                    log(f"ERROR analyzing {key}: {e}")
-
-                finally:
-                    n_done += 1
-                    prog.progress(n_done / n_total, text=f"Analyzing... {n_done}/{n_total}")
+                n_done += 1
+                prog.progress(n_done / n_total, text=f"Analyzing... {n_done}/{n_total}")
 
             prog.empty()
             st.success("Analysis finished.")
@@ -4781,8 +5099,8 @@ if key and key in st.session_state["results"]:
 
     dist = float(result.get("total_distance_km", 0.0))
     elev = float(result.get("elevation_gain_m", 0.0))
-    total_dur = float(result.get("total_duration_min", 0.0))
-    active_dur = float(result.get("active_duration_min", 0.0))
+    total_dur = float(result.get("active_duration_min", 0.0))
+    active_dur = float(result.get("pedaling_duration_min", 0.0))
 
     kcal_cum = float(np.asarray(result.get("cum_kcal_active", [0]))[-1])
     kcal_base = float(np.asarray(result.get("cum_kcal_base", [0]))[-1])
