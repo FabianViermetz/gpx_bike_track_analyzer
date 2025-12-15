@@ -1639,7 +1639,7 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
         raw_alts = np.interp(new_timestamps, timestamps, raw_alts)
         speeds = np.interp(new_timestamps, timestamps, speeds)
         dspeed = np.diff(speeds)
-        for i in range(2,len(speeds)-1):
+        for i in range(2,len(speeds)-2):
             if np.abs(dspeed[i]) > 5 and np.abs(dspeed[i+1]) > 5:
                 speeds[i] = (speeds[i] + speeds[i-2])/2.
 
@@ -5269,4 +5269,5 @@ else:
     if not lines:
         st.info("Log is empty.")
     else:
+
         st.info("\n".join(lines[-400:]))
