@@ -6,6 +6,10 @@ This repository contains a single-file Python application for advanced analysis 
 The focus is on physics-based power estimation, energetic accounting, and detailed ride statistics,
 exposed through an interactive Streamlit-based web interface.
 
+**URL for public use**:
+https://gpx-bike-analyzer.streamlit.app/
+
+
 The tool is intended for technically interested cyclists, engineers, and researchers who prefer
 transparent, model-driven calculations over black-box metrics.
 
