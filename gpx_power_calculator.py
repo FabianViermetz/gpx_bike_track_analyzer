@@ -307,6 +307,8 @@ def compute_disk_temperature(ambient_temp_c, speed_kph, headwind, brake_power_w,
         P_cool_W = disk_f_convection_W_per_K(v_kph/3.6) * dT
         E_disk_J += (-p_brake_w * (BRAKE_DISTRIBUTION_FRONT) - P_cool_W) * dt_s
         T_new_K = E_disk_J / disk_f_heat_capacity_J_per_K
+        if T_new_K < (t_amb + 273.15):
+            T_new_K = t_amb + 273.15
         disk_f_temps_K.append(T_new_K)
 
         #rear disk
@@ -315,6 +317,8 @@ def compute_disk_temperature(ambient_temp_c, speed_kph, headwind, brake_power_w,
         P_cool_W = disk_r_convection_W_per_K(v_kph/3.6) * dT
         E_disk_J += (-p_brake_w * (1-BRAKE_DISTRIBUTION_FRONT) - P_cool_W) * dt_s
         T_new_K = E_disk_J / disk_r_heat_capacity_J_per_K
+        if T_new_K < (t_amb + 273.15):
+            T_new_K = t_amb + 273.15
         disk_r_temps_K.append(T_new_K)
 
     disk_f_temps_C = [t - 273.15 for t in disk_f_temps_K[1:]]
@@ -4025,6 +4029,237 @@ def plot_environment(result):
     fig.update_layout(height=1500, margin=dict(l=30, r=20, t=50, b=30), showlegend=False)
     return fig
 
+def plot_climb_stat_grouped(result, top_n=None, mode="climb"):
+    """
+    Grouped bars in ONE plot, but each metric uses its own y-axis (because units differ a lot).
+    Order is NOT sorted (keeps list order from combined_climbs / combined_downhills).
+
+    Returns: (fig_bars, fig_table)
+    """
+    import numpy as np
+    import plotly.graph_objects as go
+
+    def _arr(x):
+        if x is None:
+            return None
+        a = np.asarray(x)
+        return a if a.ndim > 0 else None
+
+    def _safe_float(v, default=np.nan):
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    def _fmt(v, nd=1, empty=""):
+        try:
+            v = float(v)
+            if np.isnan(v) or np.isinf(v):
+                return empty
+            return f"{v:.{nd}f}"
+        except Exception:
+            return empty
+
+    def _mean_seg(pwr, i0, i1):
+        if pwr is None or len(pwr) == 0:
+            return np.nan
+        n = len(pwr)
+        i0 = int(max(0, min(n - 1, i0)))
+        i1 = int(max(0, min(n - 1, i1)))
+        if i1 < i0:
+            i0, i1 = i1, i0
+        seg = pwr[i0:i1 + 1]
+        return float(np.nanmean(seg)) if seg.size else np.nan
+
+    # --- pick input list (no sorting) ---
+    if mode == "climb":
+        items = result.get("combined_climbs", []) or []
+        title = "Uphill statistics"
+        sign = +1
+        seg_prefix = "U"
+    elif mode == "downhill":
+        items = result.get("combined_downhills", []) or []
+        title = "Downhill statistics"
+        sign = -1
+        seg_prefix = "D"
+    else:
+        raise ValueError("mode must be 'climb' or 'downhill'")
+
+    if not items:
+        fig_empty = go.Figure().add_annotation(text=f"No {mode} segments found", x=0.5, y=0.5, showarrow=False)
+        return fig_empty, fig_empty
+
+    if top_n is not None:
+        items = items[: int(top_n)]
+
+    # optional power series
+    pwr = _arr(result.get("filtered_powers"))
+    if pwr is None:
+        pwr = _arr(result.get("filtered_power_w"))
+
+    # --- build rows (keep original order) ---
+    rows = []
+    for k, s in enumerate(items, start=1):
+        dist_km   = _safe_float(s.get("distance_km"))
+        elev_mag  = abs(_safe_float(s.get("elevation_gain_m")))     # magnitude per your dict
+        grade_mag = abs(_safe_float(s.get("average_grade_pct")))    # magnitude per your dict
+        t0_min    = _safe_float(s.get("start_time"))
+        t1_min    = _safe_float(s.get("end_time"))
+        dur_min   = max(0.0, t1_min - t0_min) if np.isfinite(t0_min) and np.isfinite(t1_min) else np.nan
+
+        elev_m  = sign * elev_mag
+        grade   = sign * grade_mag
+
+        vam_mph = np.nan
+        if np.isfinite(elev_mag) and np.isfinite(dur_min) and dur_min > 1e-6:
+            vam_mph = sign * (elev_mag / (dur_min / 60.0))  # m/h
+
+        spd_kph = np.nan
+        if np.isfinite(dist_km) and np.isfinite(dur_min) and dur_min > 1e-6:
+            spd_kph = dist_km / (dur_min / 60.0)
+
+        i0 = int(s.get("start_idx", 0))
+        i1 = int(s.get("end_idx", 0))
+        avg_p = _mean_seg(pwr, i0, i1)
+
+        rows.append({
+            "label": f"{seg_prefix}{k}",
+            "start_km": _safe_float(s.get("start_distance_km")),
+            "end_km": _safe_float(s.get("end_distance_km")),
+            "dist_km": dist_km,
+            "dur_min": dur_min,
+            "grade_pct": grade,
+            "elev_m": elev_m,
+            "vam_mph": vam_mph,
+            "speed_kph": spd_kph,
+            "avg_power_w": avg_p,
+        })
+
+    labels = [r["label"] for r in rows]
+
+    # --- grouped bars with separate y-axes per metric (NO OVERLAP) ---
+    x0 = np.arange(len(rows), dtype=float)   # numeric x positions
+    labels = [r["label"] for r in rows]
+
+    # 5 bars → choose offsets around the center
+    bar_w = 0.14
+    offsets = np.array([-2, -1, 0, 1, 2], dtype=float) * bar_w
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(x=x0 + offsets[0], y=[r["elev_m"]      for r in rows], name="Δh [m]",        width=bar_w, yaxis="y"))
+    fig.add_trace(go.Bar(x=x0 + offsets[1], y=[r["grade_pct"]   for r in rows], name="Grade [%]",     width=bar_w, yaxis="y2"))
+    fig.add_trace(go.Bar(x=x0 + offsets[2], y=[r["vam_mph"]     for r in rows], name="VAM [m/h]",     width=bar_w, yaxis="y3"))
+    fig.add_trace(go.Bar(x=x0 + offsets[4], y=[r["dur_min"]     for r in rows], name="Duration [min]", width=bar_w, yaxis="y4"))
+    fig.add_trace(go.Bar(x=x0 + offsets[3], y=[r["avg_power_w"] for r in rows], name="Avg power [W]", width=bar_w, yaxis="y5"))
+
+    def _sym_range(vals, pad=0.08):
+        """Return a symmetric y-range around 0 that fits both +/- values nicely."""
+        v = np.asarray(vals, dtype=float)
+        v = v[np.isfinite(v)]
+        if v.size == 0:
+            return [-1, 1]
+        m = float(np.max(np.abs(v)))
+        if m <= 1e-12:
+            m = 1.0
+        m *= (1.0 + pad)
+        return [-m, m]
+
+    def _range_with_zero(vals, pad=0.08, neg_zero_frac=0.06):
+        """
+        Nice y-range that always includes y=0.
+        - Mixed +/-: symmetric
+        - Only positive: small negative headroom so the zero line is visible
+        - Only negative: small positive headroom
+        """
+        v = np.asarray(vals, dtype=float)
+        v = v[np.isfinite(v)]
+        if v.size == 0:
+            return [-1, 1]
+
+        vmin = float(np.min(v))
+        vmax = float(np.max(v))
+
+        # Mixed sign -> symmetric
+        if vmin < 0.0 and vmax > 0.0:
+            m = max(abs(vmin), abs(vmax))
+            m = m * (1.0 + pad) if m > 1e-12 else 1.0
+            return [-m, m]
+
+        # Only positive
+        if vmin >= 0.0:
+            m = vmax if vmax > 1e-12 else 1.0
+            top = m * (1.0 + pad)
+            bottom = -m * neg_zero_frac  # small negative space to show the zero baseline
+            return [bottom, top]
+
+        # Only negative
+        m = abs(vmin) if abs(vmin) > 1e-12 else 1.0
+        bottom = -m * (1.0 + pad)
+        top =  m * neg_zero_frac
+        return [bottom, top]
+
+    if mode == "downhill":
+        yr_elev  = _sym_range([r["elev_m"]      for r in rows])
+        yr_grade = _sym_range([r["grade_pct"]   for r in rows])
+        yr_vam   = _sym_range([r["vam_mph"]     for r in rows])
+        yr_dur   = _sym_range([r["dur_min"]     for r in rows])        # duration is usually >=0, but symmetric still OK
+        yr_pwr   = _sym_range([r["avg_power_w"] for r in rows])        # power usually >=0
+    else:
+        yr_elev  = _range_with_zero([r["elev_m"]      for r in rows])
+        yr_grade = _range_with_zero([r["grade_pct"]   for r in rows])
+        yr_vam   = _range_with_zero([r["vam_mph"]     for r in rows])
+        yr_dur   = _range_with_zero([r["dur_min"]     for r in rows])        # mostly positive
+        yr_pwr   = _range_with_zero([r["avg_power_w"] for r in rows])        # mostly positive
+
+
+    fig.update_layout(
+        title=title,
+        barmode="overlay",  # we do the grouping ourselves via x offsets
+        height=850,
+        margin=dict(l=70, r=150, t=60, b=120),
+        legend=dict(orientation="h"),
+        xaxis=dict(
+            title="Segment",
+            tickmode="array",
+            tickvals=x0,
+            ticktext=labels,
+            domain=[0.0, 0.88],
+        ),
+
+        # Shared "y=0" idea: every axis shows its own zero line and includes 0 in the range
+        yaxis =dict(title="Δh [m]",    zeroline=True, range=yr_elev),
+        yaxis2=dict(title="Grade [%]", overlaying="y", side="right", position=1.00, showgrid=False,
+                    zeroline=True, range=yr_grade),
+        yaxis3=dict(title="VAM [m/h]", overlaying="y", side="right", position=0.96, showgrid=False,
+                    zeroline=True, range=yr_vam),
+        yaxis4=dict(title="Dur [min]", overlaying="y", side="right", position=0.92, showgrid=False,
+                    zeroline=True, range=yr_dur),
+        yaxis5=dict(title="Pavg [W]",  overlaying="y", side="right", position=0.88, showgrid=False,
+                    zeroline=True, range=yr_pwr),
+    )
+
+    # --- table below ---
+    header = ["Seg", "Start–End [km]", "Len [km]", "Dur [min]", "Grade [%]", "Δh [m]", "VAM [m/h]", "Speed [km/h]", "Avg Power [W]"]
+    values = [
+        labels,
+        [f'{_fmt(r["start_km"],1)}–{_fmt(r["end_km"],1)}' for r in rows],
+        [_fmt(r["dist_km"], 2) for r in rows],
+        [_fmt(r["dur_min"], 1) for r in rows],
+        [_fmt(r["grade_pct"], 1) for r in rows],
+        [_fmt(r["elev_m"], 0) for r in rows],
+        [_fmt(r["vam_mph"], 0) for r in rows],
+        [_fmt(r["speed_kph"], 1) for r in rows],
+        [_fmt(r["avg_power_w"], 0) for r in rows],
+    ]
+
+    fig_table = go.Figure(data=[go.Table(
+        header=dict(values=header, align="left"),
+        cells=dict(values=values, align="left")
+    )])
+    fig_table.update_layout(height=450, margin=dict(l=20, r=20, t=30, b=20))
+
+    return fig, fig_table
 
 # =============================================================================
 # Map builder (Folium)
@@ -5134,7 +5369,7 @@ if key and key in st.session_state["results"]:
                 st.write("(fun tooltip unavailable - missing helper)")
 
     # tabs like Qt
-    tabs = st.tabs(["Profiles", "Segments", "Distributions", "Energy Balance", "Mechanical", "Human Body", "Environment", "Map", "Details", "Log"])
+    tabs = st.tabs(["Profiles", "Segments", "Distributions", "Energy Balance", "Mechanical", "Human Body", "Environment", "Climbs & Downhills", "Map", "Details", "Log"])
 
     cfg = build_config_from_ui(st.session_state)
 
@@ -5168,6 +5403,20 @@ if key and key in st.session_state["results"]:
         st.plotly_chart(fig, width='stretch')
 
     with tabs[7]:
+        sub_up, sub_down = st.tabs(["Uphills", "Downhills"])
+
+        with sub_up:
+            fig_up, tbl_up = plot_climb_stat_grouped(result, mode="climb", top_n=None)
+            st.plotly_chart(fig_up, width="stretch")
+            st.plotly_chart(tbl_up, width="stretch")
+
+        with sub_down:
+            fig_dn, tbl_dn = plot_climb_stat_grouped(result, mode="downhill", top_n=None)
+            st.plotly_chart(fig_dn, width="stretch")
+            st.plotly_chart(tbl_dn, width="stretch")
+
+
+    with tabs[8]:
         c1_map, c2_map, c3_map = st.columns(3)
 
         with c1_map:
@@ -5230,7 +5479,7 @@ if key and key in st.session_state["results"]:
             )
             st.plotly_chart(fig, width='stretch')
 
-    with tabs[8]:
+    with tabs[9]:
         # “Details” (similar to your stats_details)
         st.subheader("Details")
         # lines = []
