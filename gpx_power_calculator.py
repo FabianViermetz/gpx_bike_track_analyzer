@@ -23,9 +23,9 @@ import streamlit as st
 
 import folium
 import branca.colormap as cm
-from streamlit_folium import st_folium
 
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
 
 from scipy.ndimage import median_filter
@@ -36,6 +36,17 @@ try:
     from tzfpy import get_tz
 except Exception:
     get_tz = None
+from io import BytesIO
+import datetime as dt
+import re
+
+
+from PIL import Image as PILImage
+from reportlab.platypus import PageBreak
+from dataclasses import dataclass, field, asdict, is_dataclass
+from typing import Dict, Any
+
+
 
 FIX_TIME_ZONE = True
 # === Global physical constants / limits (default values) ===
@@ -131,10 +142,368 @@ class RiderBikeConfig:
     sim_power_W: float
     sim_max_downhill_kph: float
     sim_breaks_min_per_h: float
+    globals: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def mass(self) -> float:
         return self.body_mass + self.bike_mass + self.extra_mass
+
+# report function
+
+def _to_jsonable(obj, max_len=220):
+    """
+    Make values safe for ReportLab tables: short strings, no numpy scalars/arrays,
+    and handle datetime nicely.
+    """
+    import datetime as dt
+
+    if obj is None:
+        return "-"
+
+    # numpy scalars
+    if isinstance(obj, (np.generic,)):
+        obj = obj.item()
+
+    # numpy arrays -> short summary
+    if isinstance(obj, np.ndarray):
+        return f"ndarray shape={obj.shape}, dtype={obj.dtype}"
+
+    # datetime
+    if isinstance(obj, (dt.datetime, dt.date, dt.time)):
+        try:
+            return obj.isoformat(sep=" ")
+        except Exception:
+            return str(obj)
+
+    # lists/tuples -> short
+    if isinstance(obj, (list, tuple)):
+        s = ", ".join(str(x) for x in obj[:40])
+        if len(obj) > 40:
+            s += f", ... (+{len(obj)-40})"
+        if len(s) > max_len:
+            s = s[:max_len] + " ..."
+        return s
+
+    # dict -> short
+    if isinstance(obj, dict):
+        s = str(obj)
+        if len(s) > max_len:
+            s = s[:max_len] + " ..."
+        return s
+
+    # everything else
+    s = str(obj)
+    if len(s) > max_len:
+        s = s[:max_len] + " ..."
+    return s
+
+
+def cfg_to_kv_rows(cfg):
+    """
+    Returns list of [key, value] rows for the settings table.
+    Supports dict, dataclass RiderBikeConfig, and cfg.globals.
+    """
+    rows = []
+
+    if cfg is None:
+        return [["cfg", "(none)"]]
+
+    # cfg is dataclass (RiderBikeConfig)
+    if is_dataclass(cfg):
+        d = asdict(cfg)  # converts nested dataclasses too
+        # Pull globals out separately (nicer layout)
+        globals_dict = d.pop("globals", None)
+
+        # main config fields
+        for k in sorted(d.keys(), key=lambda x: x.lower()):
+            rows.append([k, _to_jsonable(d[k])])
+
+        # global params snapshot
+        if isinstance(globals_dict, dict) and globals_dict:
+            rows.append(["", ""])  # spacer row
+            rows.append(["--- globals ---", ""])
+            for k in sorted(globals_dict.keys(), key=lambda x: x.lower()):
+                rows.append([k, _to_jsonable(globals_dict[k])])
+
+        return rows
+
+    # cfg is dict
+    if isinstance(cfg, dict):
+        for k in sorted(cfg.keys(), key=lambda x: str(x).lower()):
+            rows.append([str(k), _to_jsonable(cfg[k])])
+        return rows
+
+    # fallback: unknown type
+    return [["cfg", _to_jsonable(cfg)]]
+
+def _force_colorway(fig):
+    import plotly.colors as pc
+    # Plotly default qualitative palette
+    fig.update_layout(
+        template="plotly_white",
+        colorway=pc.qualitative.Plotly
+    )
+    return fig
+
+def _fig_to_png_bytes(fig, width=1200, height=800, scale=2):
+    """
+    Convert Plotly figure to PNG bytes using kaleido.
+    This version surfaces the real exception.
+    """
+
+    try:
+        # Force kaleido explicitly + skip heavy validation (can fail on some figures)
+        png = pio.to_image(
+            fig,
+            format="png",
+            width=width,
+            height=height,
+            scale=scale,
+            engine="kaleido",
+            validate=False,
+        )
+        return png
+    except Exception as e:
+        # IMPORTANT: do not swallow this silently
+        raise RuntimeError(f"Plotly->PNG export failed: {type(e).__name__}: {e}") from e
+
+
+def build_pdf_report_bytes(
+    *,
+    result: dict,
+    cfg: dict,
+    ride_name: str,
+    figs: list,        # list of (title, plotly_fig)
+    notes: list,       # list of strings
+    include_settings: bool = True,
+):
+    """
+    Create a PDF report as bytes (no filesystem required).
+    """
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import cm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
+    from reportlab.lib import colors
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=landscape(A4),
+        leftMargin=1.5 * cm,
+        rightMargin=1.5 * cm,
+        topMargin=1.4 * cm,
+        bottomMargin=1.4 * cm,
+        title=f"GPX Report - {ride_name}",
+        author="GPX Bike Tour Analyzer",
+    )
+
+    styles = getSampleStyleSheet()
+    h1 = styles["Heading1"]
+    h2 = styles["Heading2"]
+    body = styles["BodyText"]
+    mono = ParagraphStyle("MonoSmall", parent=body, fontName="Courier", fontSize=8.5, leading=10.0)
+
+    def esc(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    story = []
+
+    # --- Title ---
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    story.append(Paragraph(f"GPX Report - {esc(str(ride_name))}", h1))
+    story.append(Paragraph(f"Created: {esc(now)}", body))
+    story.append(Spacer(1, 10))
+
+    # --- Summary ---
+    story.append(Paragraph("Summary", h2))
+
+    start_local = result.get("local_start_time")
+    end_local   = result.get("local_end_time")
+
+    def fmt_dt(x, f):
+        try:
+            return x.strftime(f) if x else "-"
+        except Exception:
+            return "-"
+
+    dist_km = float(result.get("total_distance_km", 0.0) or 0.0)
+    elev_m  = float(result.get("elevation_gain_m", 0.0) or 0.0)
+    moving_min   = float(result.get("active_duration_min", 0.0) or 0.0)
+    pedaling_min = float(result.get("pedaling_duration_min", 0.0) or 0.0)
+
+    avg_p_moving = float(result.get("avg_power_with_freewheeling", 0.0) or 0.0)
+    avg_p_active = float(result.get("avg_power_active", 0.0) or 0.0)
+
+    summary_rows = [
+        ["Date", fmt_dt(start_local, "%Y-%m-%d")],
+        ["Start (local)", fmt_dt(start_local, "%H:%M:%S")],
+        ["End (local)", fmt_dt(end_local, "%H:%M:%S")],
+        ["Distance", f"{dist_km:.2f} km"],
+        ["Elevation gain", f"{elev_m:.0f} m"],
+        ["Duration (moving)", f"{moving_min:.1f} min"],
+        ["Duration (pedaling)", f"{pedaling_min:.1f} min"],
+        ["Avg power (moving)", f"{avg_p_moving:.0f} W"],
+        ["Avg power (pedaling)", f"{avg_p_active:.0f} W"],
+    ]
+
+    t = Table(summary_rows, colWidths=[5.5 * cm, 10.5 * cm])
+    t.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.HexColor("#f7f7f7")]),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 12))
+
+    # --- Settings ---
+    
+    if include_settings:
+        story.append(PageBreak())   # <-- new page
+        story.append(Paragraph("Settings", h2))
+
+        rows = cfg_to_kv_rows(cfg)
+
+        # Escape strings for Paragraph/Table safety
+        rows_esc = []
+        for k, v in rows:
+            k = esc(str(k))
+            v = esc(str(v))
+            rows_esc.append([k, v])
+
+        tt = Table(rows_esc, colWidths=[6.0 * cm, 10.0 * cm])
+        tt.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.HexColor("#fbfbfb")]),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        story.append(tt)
+        story.append(Spacer(1, 10))
+
+    # --- Notes / Details ---
+    if notes:
+        story.append(PageBreak())   # <-- new page
+        story.append(Paragraph("Details / Notes", h2))
+        for line in notes[:500]:
+            story.append(Paragraph(esc(str(line)), mono))
+        story.append(Spacer(1, 10))
+
+    # --- Figures ---
+    story.append(PageBreak())
+    story.append(Paragraph("Plots", h1))
+    story.append(Spacer(1, 6))
+
+    if not figs:
+        story.append(Paragraph("No figures provided.", body))
+    else:
+        for title, fig in figs:
+            story.append(Paragraph(esc(str(title)), h2))
+
+            fig = _force_colorway(fig)
+            png = _fig_to_png_bytes(fig)
+
+            # --- force RGB to avoid grayscale/palette issues in reportlab ---
+            tmp = BytesIO(png)
+            im = PILImage.open(tmp)
+
+            # Convert to true RGB (no palette / no alpha)
+            if im.mode in ("P", "L", "LA", "RGBA"):
+                im = im.convert("RGB")
+            else:
+                im = im.convert("RGB")
+
+            tmp2 = BytesIO()
+            im.save(tmp2, format="PNG")
+            png_rgb = tmp2.getvalue()
+
+            img = Image(BytesIO(png_rgb))
+
+            max_w = 18.0 * cm
+            scale = min(1.0, max_w / float(img.drawWidth))
+            img.drawWidth *= scale
+            img.drawHeight *= scale
+
+            story.append(img)
+            story.append(Spacer(1, 12))
+            story.append(PageBreak())   # <-- new page
+
+    doc.build(story)
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes
+
+
+def collect_report_figs(result):
+    """
+    Collect the same figures you show in the UI.
+    Returns: list of (title, fig)
+    """
+    figs = []
+
+    # Main plots
+    try:
+        figs.append(("Profiles", plot_profiles(result, highlight_climbs=True)))
+    except Exception:
+        pass
+
+    try:
+        figs.append(("5 km Segments – Power Components", plot_segments(result)))
+    except Exception:
+        pass
+
+    try:
+        figs.append(("Distributions", plot_distributions(result, max_speed=MAX_SPEED, max_pwr=MAX_PWR)))
+    except Exception:
+        pass
+
+    try:
+        figs.append(("Energy Balance (Sankey)", plot_sankey(result)))
+    except Exception:
+        pass
+
+    try:
+        figs.append(("Mechanical", plot_mechanical(result)))
+    except Exception:
+        pass
+
+    try:
+        figs.append(("Human Body", plot_human(result)))
+    except Exception:
+        pass
+
+    try:
+        figs.append(("Environment", plot_environment(result)))
+    except Exception:
+        pass
+
+    # Climbs/Downhills (include tables too)
+    try:
+        fig_up, tbl_up = plot_climb_stat_grouped(result, mode="climb", top_n=None)
+        figs.append(("Uphills – chart", fig_up))
+        figs.append(("Uphills – table", tbl_up))
+    except Exception:
+        pass
+
+    try:
+        fig_dn, tbl_dn = plot_climb_stat_grouped(result, mode="downhill", top_n=None)
+        figs.append(("Downhills – chart", fig_dn))
+        figs.append(("Downhills – table", tbl_dn))
+    except Exception:
+        pass
+
+    return figs
 
 
 # =====================================================================
@@ -3493,6 +3862,54 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
     front_teeth = [int(x.strip()) for x in str(state["front_teeth"]).split(",") if x.strip()]
     rear_teeth  = [int(x.strip()) for x in str(state["rear_teeth"]).split(",") if x.strip()]
 
+    # --- collect all global analysis/environment parameters ---
+    globals_dict = {
+        # analysis / simulation
+        "EFFICIENCY": EFFICIENCY,
+        "BASE_MET_DURING_ACTIVITY": BASE_MET_DURING_ACTIVITY,
+        "MAX_SPEED": MAX_SPEED,
+        "MAX_GRADE": MAX_GRADE,
+        "MAX_PWR": MAX_PWR,
+        "MIN_ACTIVE_SPEED": MIN_ACTIVE_SPEED,
+        "MIN_VALID_SPEED": MIN_VALID_SPEED,
+        "HYSTERESIS_REAR_RPM": HYSTERESIS_REAR_RPM,
+        "MIN_SHIFT_INTERVAL_REAR_SEC": MIN_SHIFT_INTERVAL_REAR_SEC,
+        "MAX_MAP_POINTS": MAX_MAP_POINTS,
+        "COMBINE_BREAK_MAX_TIME_DIFF": COMBINE_BREAK_MAX_TIME_DIFF,
+        "COMBINE_BREAK_MAX_DISTANCE": COMBINE_BREAK_MAX_DISTANCE,
+        "GRAVITY": G,
+
+        # climb detection
+        "CLIMB_MIN_DISTANCE_KM": CLIMB_MIN_DISTANCE_KM,
+        "CLIMB_MIN_ELEVATION_GAIN_M": CLIMB_MIN_ELEVATION_GAIN_M,
+        "CLIMB_END_AVERAGE_GRADE_PCT": CLIMB_END_AVERAGE_GRADE_PCT,
+        "CLIMB_END_WINDOW_SIZE_M": CLIMB_END_WINDOW_SIZE_M,
+        "MAX_DIST_BETWEEN_CLIMBS_M": MAX_DIST_BETWEEN_CLIMBS_M,
+
+        # smoothing
+        "SMOOTHING_WINDOW_SIZE_S": SMOOTHING_WINDOW_SIZE_S,
+
+        # brakes
+        "BRAKE_FRONT_DIAMETER_MM": BRAKE_FRONT_DIAMETER_MM,
+        "BRAKE_REAR_DIAMETER_MM": BRAKE_REAR_DIAMETER_MM,
+        "BRAKE_ADD_COOLING_FACTOR": BRAKE_ADD_COOLING_FACTOR,
+        "BRAKE_PERFORATION_FACTOR": BRAKE_PERFORATION_FACTOR,
+        "BRAKE_DISTRIBUTION_FRONT": BRAKE_DISTRIBUTION_FRONT,
+
+        # aero / environment
+        "REFERENCE_CDA_VALUE": REFERENCE_CDA_VALUE,
+        "AMBIENT_TEMP_C": AMBIENT_TEMP_C,
+        "AMBIENT_RHO": AMBIENT_RHO,
+        "AMBIENT_PRES_HPA": AMBIENT_PRES_HPA,
+        "AMBIENT_RHUM_PCT": AMBIENT_RHUM_PCT,
+        "AMBIENT_WIND_DIR_DEG": AMBIENT_WIND_DIR_DEG,
+        "AMBIENT_WIND_SPEED_MS": AMBIENT_WIND_SPEED_MS,
+
+        # time override
+        "USE_DATETIME_OVERRIDE": USE_DATETIME_OVERRIDE,
+        "OVERRIDE_RIDE_START_DATETIME": OVERRIDE_RIDE_START_DATETIME,
+    }
+
     return RiderBikeConfig(
         body_mass=float(state["body_mass"]),
         body_height=height,
@@ -3512,7 +3929,8 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
         tube_weight_g= float(state["TUBE_WEIGHT"]),
         sim_power_W=float(state["RIDER_POWER_SIM"]),
         sim_max_downhill_kph=float(state["MAX_SPEED_SIM"]),
-        sim_breaks_min_per_h=float(state["BREAKS_MIN_PER_H"])
+        sim_breaks_min_per_h=float(state["BREAKS_MIN_PER_H"]),
+        globals=globals_dict
     )
 
 
@@ -4036,8 +4454,6 @@ def plot_climb_stat_grouped(result, top_n=None, mode="climb"):
 
     Returns: (fig_bars, fig_table)
     """
-    import numpy as np
-    import plotly.graph_objects as go
 
     def _arr(x):
         if x is None:
@@ -5238,7 +5654,7 @@ with col_u1:
             details_lines = []
 
             cfg = build_config_from_ui(st.session_state)
-
+            
             prog = st.progress(0.0, text="Analyzing...")
             n_total = max(1, len(analyze_keys))
             n_done = 0
@@ -5372,6 +5788,50 @@ if key and key in st.session_state["results"]:
     tabs = st.tabs(["Profiles", "Segments", "Distributions", "Energy Balance", "Mechanical", "Human Body", "Environment", "Climbs & Downhills", "Map", "Details", "Log"])
 
     cfg = build_config_from_ui(st.session_state)
+
+    # ---------------- PDF report export ----------------
+    st.subheader("Report")
+
+    col_r1, col_r2 = st.columns([1, 2], vertical_alignment="center")
+
+    with col_r1:
+        build_pdf = st.button("Build PDF report")
+        
+    with col_r2:
+        # download appears after build
+        pdf_bytes = st.session_state.get("latest_pdf_bytes", None)
+        if pdf_bytes:
+            ride_name = st.session_state.get("uploads_name", {}).get(key, key)
+            safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", ride_name)
+            st.download_button(
+                label="Download PDF report",
+                data=pdf_bytes,
+                file_name=f"GPX_Report_{safe_name}.pdf",
+                mime="application/pdf",
+            )
+
+    if build_pdf:
+        with st.spinner("Creating PDF..."):
+            ride_name = st.session_state.get("uploads_name", {}).get(key, key)
+
+            figs = collect_report_figs(result)
+
+            # your "details" tab content is already a list of lines, perfect for notes
+            notes = details if isinstance(details, list) else [str(details)]
+
+            pdf_bytes = build_pdf_report_bytes(
+                result=result,
+                cfg=cfg,
+                ride_name=ride_name,
+                figs=figs,
+                notes=notes,
+                include_settings=True,
+            )
+
+            st.session_state["latest_pdf_bytes"] = pdf_bytes
+            st.success("PDF created. Use the download button above.")
+
+
 
     with tabs[0]:
         highlight = st.checkbox("Highlight climbs/downhills", value=False)
@@ -5507,7 +5967,7 @@ if key and key in st.session_state["results"]:
        
         
 
-    with tabs[9]:
+    with tabs[10]:
         st.subheader("Log")
         render_log()
 
