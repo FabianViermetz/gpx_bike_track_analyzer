@@ -9,6 +9,7 @@ import tempfile
 import random
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
+import datetime as dt
 from typing import Dict, Any, List, Optional
 
 import numpy as np
@@ -29,7 +30,6 @@ from plotly.subplots import make_subplots
 
 from scipy.ndimage import median_filter
 
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 try:
@@ -44,7 +44,7 @@ DEFAULT_ENERGY_BAR_SIZE_KCAL, ENERGY_BAR_SIZE_KCAL = 250., 250.          # human
 DEFAULT_BASE_MET_DURING_ACTIVITY, BASE_MET_DURING_ACTIVITY = 1.2, 1.2  # ~light activity; tweak if you want  # [dimensionless MET]
 DEFAULT_G, G = 9.81, 9.81                   # m/s²
 
-DEFAULT_REFERENCE_CDA_VALUE, REFERENCE_CDA_VALUE = 0.324, 0.324 # cda for cycling [m^2]
+DEFAULT_REFERENCE_CDA_VALUE, REFERENCE_CDA_VALUE = 0.426, 0.426 # cda for cycling [m^2]
 
 DEFAULT_MAX_SPEED, MAX_SPEED = 120.0, 120.0          # km/h (for filters & histograms)
 DEFAULT_MAX_GRADE, MAX_GRADE = 35.0, 35.0           # % absolute max grade for filters
@@ -89,6 +89,8 @@ REFERENCE_LOAD_FOR_CRR_KG = 42.6376827
 REFERENCE_SPEED_FOR_CRR_MS = 8.04672
 
 REFERENCE_HEIGHT_FOR_CDA = 1.80 # 1.80 as reference for the cda. so cda can be calculated using the body height
+CDA_HEIGHT_IMPACT_FACTOR = 1.0 # cda is directly scaled by height when this is 1.0
+
 
 DEFAULT_AMBIENT_WIND_SPEED_MS, AMBIENT_WIND_SPEED_MS = 0., 0.
 DEFAULT_AMBIENT_WIND_DIR_DEG, AMBIENT_WIND_DIR_DEG = 0., 0.
@@ -98,6 +100,13 @@ DEFAULT_AMBIENT_RHUM_PCT, AMBIENT_RHUM_PCT = 50., 50.
 DEFAULT_AMBIENT_RHO, AMBIENT_RHO = 1.225, 1.225
 
 SEGMENT_MEAN_MODE = False  # global/module-level toggle
+
+OVERRIDE_RIDE_START_DATETIME = dt_local = dt.datetime.combine(dt.date.today(), dt.time(9, 0))
+USE_DATETIME_OVERRIDE = False
+
+DEFAULT_TIRE_WEIGHT_G = 250.
+DEFAULT_TUBE_WEIGHT_G = 100.
+DEFAULT_RIM_WEIGHT_G = 450.
 
 details_lines = []
 
@@ -116,6 +125,9 @@ class RiderBikeConfig:
     draft_effect: float       # dimensionless multiplier (<1 when drafting)
     draft_effect_dh: float       # dimensionless multiplier (<1 when drafting)
     draft_effect_uh: float       # dimensionless multiplier (<1 when drafting)
+    tire_weight_g: float       
+    tube_weight_g: float       
+    rim_weight_g: float       
 
     @property
     def mass(self) -> float:
@@ -231,7 +243,7 @@ def moving_average(data, window_size):
     data_despiked = hampel_fast(
         data,
         window_size=max(1, window_size // 2),
-        n_sigmas=3.0,
+        n_sigmas=1.0,
     )
 
     n = data_despiked.size
@@ -508,16 +520,20 @@ def compute_power(speed, acc, grade, wind_speed, cfg: RiderBikeConfig, rho_air, 
     else:
         local_draft_factor = cfg.draft_effect
 
+    wheel_radius_m = cfg.wheel_circumference / 2. / np.pi
 
     Fg = cfg.mass * G * math.sin(slope_angle)
     Fr = cfg.mass * G * cfg.crr * math.cos(slope_angle)
     Fd = 0.5 * rho_air * cfg.cda * v_rel**2 * local_draft_factor
     Fa = cfg.mass * acc
-    
+    Fi = (cfg.rim_weight_g/1000. + cfg.tube_weight_g/1000. + cfg.tire_weight_g/1000.) * acc # from I = m*R^2 and m_eq = m/R^2 --> m_eq = m
+
+
     P_g = (Fg) * speed
     P_r = (Fr) * speed
     P_d = (Fd) * speed
-    P_a = (Fa) * speed
+    P_a = (Fa+Fi*2) * speed
+
     p = (P_g + P_r + P_d + P_a) / (1.0 - cfg.drivetrain_loss) if (P_g + P_r + P_d + P_a) > 0 else (P_g + P_r + P_d + P_a) / (1.0 - 0.01) # 1% in hubs only full loss only when pedaling
     P_pt = p - (P_g + P_r + P_d + P_a)
     return p, P_g, P_r, P_d, P_a, P_pt
@@ -1541,7 +1557,48 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
                 prev_point = point
                 prev_time = times[-1]  # UTC
 
+    # -------------------------------------------------------------------------
+    # Optional: override ride start datetime (static offset applied to ALL points)
+    # Assumptions:
+    # - `times` is a list of aware UTC datetimes (as in your snippet)
+    # - `times_local_display` is for display only
+    # - `OVERRIDE_RIDE_START_DATETIME` is a naive LOCAL datetime chosen by user
+    # - `track_tzinfo` was determined from GPS (tzfpy/your utc_to_local_from_gps)
+    # -------------------------------------------------------------------------
+    if USE_DATETIME_OVERRIDE and len(times) > 0:
+        first_utc = times[0]  # aware UTC
 
+        # interpret user's override start as *local* at the ride location
+        # and convert it to UTC to get the desired first timestamp in UTC
+        try:
+            # best case: we know local tzinfo from GPS
+            if FIX_TIME_ZONE and (track_tzinfo is not None):
+                manual_local_aware = OVERRIDE_RIDE_START_DATETIME.replace(tzinfo=track_tzinfo)
+                manual_start_utc = manual_local_aware.astimezone(timezone.utc)
+            else:
+                # fallback: treat override as UTC if we cannot determine local tz
+                manual_start_utc = OVERRIDE_RIDE_START_DATETIME.replace(tzinfo=timezone.utc)
+
+            # constant shift so that first point matches manual start time
+            dt_shift = manual_start_utc - first_utc
+
+            # shift all UTC times
+            times = [t + dt_shift for t in times]
+
+            # rebuild display times consistently from shifted UTC
+            if FIX_TIME_ZONE and (track_tzinfo is not None):
+                times_local_display = [t.astimezone(track_tzinfo) for t in times]
+            else:
+                # if you don't have a tz, just show shifted UTC
+                times_local_display = list(times)
+
+            # (optional) keep a handy value in result for later UI display/debug
+            # result["dt_override_shift_s"] = dt_shift.total_seconds()
+
+        except Exception:
+            # if anything goes wrong, do NOT break the ride; just keep original times
+            pass
+    # -------------------------------------------------------------------------
     cut_beginning = 0
     cut_end = 0
     # store both for later use
@@ -1578,6 +1635,10 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
         lons = np.interp(new_timestamps, timestamps, lons)
         raw_alts = np.interp(new_timestamps, timestamps, raw_alts)
         speeds = np.interp(new_timestamps, timestamps, speeds)
+        dspeed = np.diff(speeds)
+        for i in range(2,len(speeds)-1):
+            if np.abs(dspeed[i]) > 5 and np.abs(dspeed[i+1]) > 5:
+                speeds[i] = (speeds[i] + speeds[i-2])/2.
 
         def _interp_sensor(raw_list):
             arr = np.asarray(raw_list, dtype=float)
@@ -1664,7 +1725,7 @@ def _smooth_and_grades(core):
 
     smoothed_total_dists = moving_average(total_dists, window_size=SMOOTHING_WINDOW_SIZE_S)
     smoothed_speeds_kph = moving_average(speeds_kph, window_size=SMOOTHING_WINDOW_SIZE_S)
-    smoothed_alts = moving_average(raw_alts, window_size=SMOOTHING_WINDOW_SIZE_S)
+    smoothed_alts = moving_average(raw_alts, window_size=1)
     smoothed_speeds_ms = smoothed_speeds_kph / 3.6
 
     grades = compute_grade_array(smoothed_alts, dists)
@@ -2054,10 +2115,16 @@ def _detect_directional_segments(
         return segments
 
     # Work on "height" h so that increasing h always means "uphill"
-    h = direction * np.asarray(smoothed_alts, dtype=float)
-    dists_step = np.asarray(deltadists, dtype=float)
-    times = np.asarray(times, dtype=object)
-    dists_cum = np.asarray(dists, dtype=float)
+    if direction == 1:
+        h = np.asarray(smoothed_alts, dtype=float)
+        dists_step = np.asarray(deltadists, dtype=float)
+        times = np.asarray(times, dtype=object)
+        dists_cum = np.asarray(dists, dtype=float)
+    if direction == -1:
+        h = np.asarray(smoothed_alts, dtype=float)[::-1]
+        dists_step = np.asarray(deltadists, dtype=float)[::-1]
+        times = np.asarray(times, dtype=object)[::-1]
+        dists_cum = np.asarray(dists, dtype=float)[::-1]
 
     start_idx = None
 
@@ -2097,17 +2164,31 @@ def _detect_directional_segments(
                 if dist_km > 0 else 0.0
             )
 
-            segments.append({
-                "start_idx": start_idx,
-                "end_idx": end_idx,
-                "distance_km": dist_km,
-                "elevation_gain_m": elev_gain_h,           # always positive magnitude
-                "average_grade_pct": avg_grade_pct,        # always positive magnitude
-                "start_time": times[start_idx].timestamp() / 60.0 - times[0].timestamp() / 60.0,
-                "end_time": times[end_idx].timestamp() / 60.0 - times[0].timestamp() / 60.0,
-                "start_distance_km": dists_cum[start_idx],
-                "end_distance_km": dists_cum[end_idx],
-            })
+            if direction == 1:
+                segments.append({
+                    "start_idx": start_idx,
+                    "end_idx": end_idx,
+                    "distance_km": dist_km,
+                    "elevation_gain_m": elev_gain_h,           # always positive magnitude
+                    "average_grade_pct": avg_grade_pct,        # always positive magnitude
+                    "start_time": times[start_idx].timestamp() / 60.0 - times[0].timestamp() / 60.0,
+                    "end_time": times[end_idx].timestamp() / 60.0 - times[0].timestamp() / 60.0,
+                    "start_distance_km": dists_cum[start_idx],
+                    "end_distance_km": dists_cum[end_idx],
+                })
+            if direction == -1:
+                max_idx = len(times)-1
+                segments.append({
+                    "start_idx": max_idx - end_idx,
+                    "end_idx": max_idx - start_idx,
+                    "distance_km": dist_km,
+                    "elevation_gain_m": elev_gain_h,           # always positive magnitude
+                    "average_grade_pct": avg_grade_pct,        # always positive magnitude
+                    "start_time": times[end_idx].timestamp() / 60.0 - times[-1].timestamp() / 60.0,
+                    "end_time": times[start_idx].timestamp() / 60.0 - times[-1].timestamp() / 60.0,
+                    "start_distance_km": dists_cum[end_idx],
+                    "end_distance_km": dists_cum[start_idx],
+                })
 
         # move start forward
         start_idx = end_idx
@@ -2210,6 +2291,8 @@ def _detect_climbs_and_downhills(smoothed_alts, deltadists, times, dists):
         end_avg_grade_pct=CLIMB_END_AVERAGE_GRADE_PCT,
         max_gap_m=MAX_DIST_BETWEEN_CLIMBS_M,
     )
+
+    downhills = downhills[::-1]
     combined_downhills = _combine_adjacent_segments(downhills, MAX_DIST_BETWEEN_CLIMBS_M)
 
     ride_type_series = _create_ride_type_timeseries(len(smoothed_alts), combined_climbs, combined_downhills)
@@ -2645,6 +2728,8 @@ def analyze_gpx_file(
 
     _augment_climb_metrics(climbs, filtered["filtered_dists"], filtered["filtered_powers"], timestep_min)
     _augment_climb_metrics(combined_climbs, filtered["filtered_dists"], filtered["filtered_powers"], timestep_min)
+    _augment_climb_metrics(downhills, filtered["filtered_dists"], filtered["filtered_powers"], timestep_min)
+    _augment_climb_metrics(combined_downhills, filtered["filtered_dists"], filtered["filtered_powers"], timestep_min)
 
     # climb summary metrics
     max_vam = 0.0
@@ -2662,6 +2747,7 @@ def analyze_gpx_file(
             num = sum(p * w for p, w in weighted_list)
             den = sum(w for _, w in weighted_list)
             avg_climb_power = float(num / den) if den > 0 else 0.0
+
 
     # 10) Segments 5 km
     _report(87, "Build 5 km segments...")
@@ -2735,6 +2821,26 @@ def analyze_gpx_file(
     print("\n=== Climb Combination ===")
     for i, climb in enumerate(combined_climbs):
         print(f" Combined Climb {i+1}: {climb['distance_km']:.2f} km, "
+              f"{climb['elevation_gain_m']:.0f} m gain, "
+              f"avg grade {climb['average_grade_pct']:.1f} %, "
+              f"VAM {climb.get('vam_m_per_h', 0.0):.0f} m/h, "
+              f"P_avg {climb.get('avg_power_w', 0.0):.0f} W, "
+              f"from {time_to_readable(t_minutes=climb['start_time'])} to {time_to_readable(t_minutes=climb['end_time'])}, "
+              f"distance {climb['start_distance_km']:.2f} km to {climb['end_distance_km']:.2f} km")
+        
+    print("\n=== Downhill Statistics ===")
+    print(f"Detected Downhills: {len(downhills)}")
+    for i, climb in enumerate(downhills):
+        print(f" Downhill {i+1}: {climb['distance_km']:.2f} km, "
+              f"{climb['elevation_gain_m']:.0f} m gain, "
+              f"avg grade {climb['average_grade_pct']:.1f} %, "
+              f"VAM {climb.get('vam_m_per_h', 0.0):.0f} m/h, "
+              f"P_avg {climb.get('avg_power_w', 0.0):.0f} W, "
+              f"from {time_to_readable(t_minutes=climb['start_time'])} to {time_to_readable(t_minutes=climb['end_time'])}, "
+              f"distance {climb['start_distance_km']:.2f} km to {climb['end_distance_km']:.2f} km")
+    print("\n=== Downhill Combination ===")
+    for i, climb in enumerate(combined_downhills):
+        print(f" Combined Downhill {i+1}: {climb['distance_km']:.2f} km, "
               f"{climb['elevation_gain_m']:.0f} m gain, "
               f"avg grade {climb['average_grade_pct']:.1f} %, "
               f"VAM {climb.get('vam_m_per_h', 0.0):.0f} m/h, "
@@ -3017,7 +3123,10 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
     global SMOOTHING_WINDOW_SIZE_S
     global REFERENCE_CDA_VALUE
     global AMBIENT_TEMP_C, AMBIENT_RHO, AMBIENT_PRES_HPA, AMBIENT_RHUM_PCT, AMBIENT_WIND_DIR_DEG, AMBIENT_WIND_SPEED_MS
+    global OVERRIDE_RIDE_START_DATETIME
+    global USE_DATETIME_OVERRIDE
 
+    # --- analysis / simulation globals ---
     EFFICIENCY = float(state["EFFICIENCY"])
     BASE_MET_DURING_ACTIVITY = float(state["BASE_MET_DURING_ACTIVITY"])
 
@@ -3032,18 +3141,25 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
     MAX_MAP_POINTS = int(state["MAX_MAP_POINTS"])
     COMBINE_BREAK_MAX_TIME_DIFF = int(state["COMBINE_BREAK_MAX_TIME_DIFF"])
     COMBINE_BREAK_MAX_DISTANCE = int(state["COMBINE_BREAK_MAX_DISTANCE"])
+
     G = float(state["GRAVITY"])
+
     CLIMB_MIN_DISTANCE_KM = float(state["CLIMB_MIN_DISTANCE_KM"])
     CLIMB_MIN_ELEVATION_GAIN_M = int(state["CLIMB_MIN_ELEVATION_GAIN_M"])
     CLIMB_END_AVERAGE_GRADE_PCT = float(state["CLIMB_END_AVERAGE_GRADE_PCT"])
     CLIMB_END_WINDOW_SIZE_M = int(state["CLIMB_END_WINDOW_SIZE_M"])
     MAX_DIST_BETWEEN_CLIMBS_M = int(state["MAX_DIST_BETWEEN_CLIMBS_M"])
+
     SMOOTHING_WINDOW_SIZE_S = int(state["SMOOTHING_WINDOW_SIZE_S"])
+
+    # --- brake globals ---
     BRAKE_FRONT_DIAMETER_MM = float(state["BRAKE_FRONT_DIAMETER_MM"])
     BRAKE_REAR_DIAMETER_MM = float(state["BRAKE_REAR_DIAMETER_MM"])
     BRAKE_ADD_COOLING_FACTOR = float(state["BRAKE_ADD_COOLING_FACTOR"])
     BRAKE_PERFORATION_FACTOR = float(state["BRAKE_PERFORATION_FACTOR"])
     BRAKE_DISTRIBUTION_FRONT = float(state["BRAKE_DISTRIBUTION_FRONT"])
+
+    # --- aero / env globals ---
     REFERENCE_CDA_VALUE = float(state["REFERENCE_CDA_VALUE"])
 
     AMBIENT_TEMP_C = float(state["AMBIENT_TEMP_C"])
@@ -3053,10 +3169,33 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
     AMBIENT_WIND_DIR_DEG = float(state["AMBIENT_WIND_DIR_DEG"])
     AMBIENT_WIND_SPEED_MS = float(state["AMBIENT_WIND_SPEED_MS"])
 
+    # --- NEW: override start datetime (LOCAL, naive) ---
+    # default: today 09:00 local (same as your initialization line)
+    default_dt_local = dt.datetime.combine(dt.date.today(), dt.time(9, 0))
+
+    USE_DATETIME_OVERRIDE = bool(state.get("USE_DATETIME_OVERRIDE", False))
+    if USE_DATETIME_OVERRIDE:
+        manual_date = state.get("manual_date", None)
+        manual_time = state.get("manual_time", None)
+
+        # streamlit normally returns datetime.date / datetime.time; but keep it robust
+        try:
+            if manual_date is None:
+                manual_date = dt.date.today()
+            if manual_time is None:
+                manual_time = dt.time(9, 0)
+            OVERRIDE_RIDE_START_DATETIME = dt.datetime.combine(manual_date, manual_time)
+        except Exception:
+            OVERRIDE_RIDE_START_DATETIME = default_dt_local
+    else:
+        OVERRIDE_RIDE_START_DATETIME = default_dt_local
+    # ---------------------------------------------------
+
+
     # Keep your original scaling logic for CdA with height
     # cda_scaled = REFERENCE_CDA_VALUE * (1 - 0.5*(1-(height/REFERENCE_HEIGHT_FOR_CDA)))
     height = float(state["body_height"])
-    CDA_VALUE = float(REFERENCE_CDA_VALUE) * (1.0 - 0.5 * (1.0 - (height / REFERENCE_HEIGHT_FOR_CDA)))
+    CDA_VALUE = float(REFERENCE_CDA_VALUE) * (1.0 - CDA_HEIGHT_IMPACT_FACTOR * (1.0 - (height / REFERENCE_HEIGHT_FOR_CDA)))
     calculated_crr = float(state["REFERENCE_ROLLING_LOSS"]) / (REFERENCE_LOAD_FOR_CRR_KG * 9.81 * REFERENCE_SPEED_FOR_CRR_MS)
 
 
@@ -3077,6 +3216,9 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
         draft_effect=float(state["draft_effect"]),
         draft_effect_dh=float(state["draft_effect_dh"]),
         draft_effect_uh=float(state["draft_effect_uh"]),
+        rim_weight_g= float(state["RIM_WEIGHT"]),
+        tire_weight_g= float(state["TIRE_WEIGHT"]),
+        tube_weight_g= float(state["TUBE_WEIGHT"]),
     )
 
 
@@ -4009,10 +4151,32 @@ with st.sidebar:
     st.header("Settings")
 
     # Basic settings
+    with st.expander("Ride Environment and Date/Time", expanded=True):
+        st.session_state["use_wind"] = st.checkbox(
+            "Use weather data (Meteostat)",
+            value=False,
+            help="If enabled, use Meteostat weather. If disabled, use the ambient overrides below.\n\nDefault: off",
+        )
+        st.session_state["USE_DATETIME_OVERRIDE"] = st.checkbox(
+            "Override Start Date and Time (local)",
+            value=False,
+            help="If enabled, use the date and time overrides below.\n\nDefault: off",
+        )
+        st.session_state["manual_date"]  = st.date_input(
+            "Override Date",
+            value=dt.date.today(),
+            help="Override local date for the ride start"
+        )
+        st.session_state["manual_time"]  = st.time_input(
+            "Override Time",
+            value=dt.time(9, 0),
+            help="Override local time for the ride start"
+        )
+
     with st.expander("Rider and Behavior", expanded=True):
         st.session_state["body_mass"] = st.number_input(
             "Rider mass [kg]",
-            min_value=30.0,
+            min_value=0.0,
             max_value=150.0,
             value=70.0,
             step=0.5,
@@ -4020,15 +4184,32 @@ with st.sidebar:
         )
         st.session_state["body_height"] = st.number_input(
             "Rider height [m]",
-            min_value=1.0,
-            max_value=2.5,
+            min_value=0.0,
+            max_value=4.0,
             value=1.80,
             step=0.01,
             help="Rider height used for CdA scaling (if applicable).\n\nDefault: 1.80 m",
         )
+        st.session_state["REFERENCE_CDA_VALUE"] = st.number_input(
+            "Reference CdA [m²]",
+            min_value=0.0,
+            max_value=1.5,
+            value=float(DEFAULT_REFERENCE_CDA_VALUE),
+            step=0.01,
+            format="%.4f",
+            help=(
+                f"Reference CdA [m²] value used for aerodynamic drag. Reference height is {REFERENCE_HEIGHT_FOR_CDA:.2f}m. Your height is used to adapt this reference value to your physique\n\n"
+                "Mountainbike, Trecking: ~0.626\n\n"
+                "Road/Gravel Racing (hoods): ~0.426\n\n"
+                "Time Trial: ~0.334\n\n"
+                "Values derived from https://www.researchgate.net/publication/259742352_An_experimental_study_of_bicycle_aerodynamics \n\n"
+                f"Default: {DEFAULT_REFERENCE_CDA_VALUE:.4f}\n\n"
+                "TIP: You can calibrate this: Roll down a slight slope without pedaling and braking --> tune this value until the simulation outputs 0 W total power in this segment."
+            )
+        )
         st.session_state["draft_effect"] = st.number_input(
             "Level draft factor [-]",
-            min_value=0.1,
+            min_value=0.0,
             max_value=1.5,
             value=1.0,
             step=0.05,
@@ -4036,7 +4217,7 @@ with st.sidebar:
         )
         st.session_state["draft_effect_dh"] = st.number_input(
             "Downhill draft factor [-]",
-            min_value=0.1,
+            min_value=0.0,
             max_value=1.5,
             value=1.0,
             step=0.05,
@@ -4044,7 +4225,7 @@ with st.sidebar:
         )
         st.session_state["draft_effect_uh"] = st.number_input(
             "Uphill draft factor [-]",
-            min_value=0.1,
+            min_value=0.0,
             max_value=1.5,
             value=1.0,
             step=0.05,
@@ -4060,6 +4241,22 @@ with st.sidebar:
         )
 
     with st.expander("Bike", expanded=True):
+        st.session_state["bike_mass"] = st.number_input(
+            "Bike mass [kg]",
+            min_value=0.0,
+            max_value=30.0,
+            value=9.0,
+            step=0.5,
+            help="Bike mass without rider.\n\nDefault: 9.0 kg",
+        )
+        st.session_state["extra_mass"] = st.number_input(
+            "Packing mass [kg]",
+            min_value=0.0,
+            max_value=100.0,
+            value=3.0,
+            step=0.5,
+            help="Extra carried mass (bags, bottles, tools, etc.).\n\nDefault: 3.0 kg",
+        )
         st.session_state["front_teeth"] = st.text_input(
             "Front teeth (comma-separated)",
             value="34,50",
@@ -4070,25 +4267,9 @@ with st.sidebar:
             value="11,12,13,14,15,17,19,21,24,28,32",
             help='Cassette tooth counts, comma-separated. Example: "11,12,13,...".\n\nDefault: 11,12,13,14,15,17,19,21,24,28,32',
         )
-        st.session_state["bike_mass"] = st.number_input(
-            "Bike mass [kg]",
-            min_value=3.0,
-            max_value=30.0,
-            value=9.0,
-            step=0.5,
-            help="Bike mass without rider.\n\nDefault: 9.0 kg",
-        )
-        st.session_state["extra_mass"] = st.number_input(
-            "Extra mass [kg]",
-            min_value=0.0,
-            max_value=30.0,
-            value=3.0,
-            step=0.5,
-            help="Extra carried mass (bags, bottles, tools, etc.).\n\nDefault: 3.0 kg",
-        )
         st.session_state["BRAKE_FRONT_DIAMETER_MM"] = st.number_input(
             "Front brake dia [mm]",
-            min_value=100.0,
+            min_value=80.0,
             max_value=300.0,
             value=float(DEFAULT_BRAKE_FRONT_DIAMETER_MM),
             step=1.0,
@@ -4116,22 +4297,54 @@ with st.sidebar:
             step=0.01,
             format="%.3f",
             help=(
-                "Constant rolling loss per wheel at the reference condition (used by your rolling model).\n\n"
+                "Constant rolling loss per wheel at the reference condition (94lbs, 18mph).\n\n"
+                f"according to https://www.bicyclerollingresistance.com/ \n\n"
                 f"Default: {DEFAULT_REFERENCE_ROLLING_LOSS:.3f} W"
+            ),
+        )
+        st.session_state["RIM_WEIGHT"] = st.number_input(
+            "Single Rim Weight [g]",
+            min_value=0.0,
+            max_value=4000.0,
+            value=float(DEFAULT_RIM_WEIGHT_G),
+            step=1.,
+            format="%.1f",
+            help=(
+                "Rim Weight (used by the inertia model).\n\n"
+                f"Default: {DEFAULT_RIM_WEIGHT_G:.1f} W"
+            ),
+        )
+        st.session_state["TUBE_WEIGHT"] = st.number_input(
+            "Single Tube Weight [g]",
+            min_value=0.0,
+            max_value=500.0,
+            value=float(DEFAULT_TUBE_WEIGHT_G),
+            step=1.,
+            format="%.1f",
+            help=(
+                "Tube Weight (used by the inertia model).\n\n"
+                f"Default: {DEFAULT_TUBE_WEIGHT_G:.1f} W"
+            ),
+        )
+        st.session_state["TIRE_WEIGHT"] = st.number_input(
+            "Single Tire Weight [g]",
+            min_value=0.0,
+            max_value=1000.0,
+            value=float(DEFAULT_TIRE_WEIGHT_G),
+            step=1.,
+            format="%.1f",
+            help=(
+                "Tire Weight (used by the inertia model).\n\n"
+                f"Default: {DEFAULT_TIRE_WEIGHT_G:.1f} W"
             ),
         )
 
     with st.expander("Environment", expanded=False):
         # --- Ambient / environment overrides (manual) ---
-        st.session_state["use_wind"] = st.checkbox(
-            "Use weather data (Meteostat)",
-            value=True,
-            help="If enabled, use Meteostat weather. If disabled, use the ambient overrides below.\n\nDefault: off",
-        )
 
         st.session_state["AMBIENT_WIND_SPEED_MS"] = st.number_input(
             "Ambient wind speed [m/s]",
-            min_value=0.0,
+            min_value=-40.0,
             max_value=40.0,
             value=float(AMBIENT_WIND_SPEED_MS),
             step=0.1,
@@ -4158,8 +4371,8 @@ with st.sidebar:
 
         st.session_state["AMBIENT_TEMP_C"] = st.number_input(
             "Ambient temperature [°C]",
-            min_value=-30.0,
-            max_value=50.0,
+            min_value=-50.0,
+            max_value=70.0,
             value=float(AMBIENT_TEMP_C),
             step=0.5,
             format="%.1f",
@@ -4171,8 +4384,8 @@ with st.sidebar:
 
         st.session_state["AMBIENT_PRES_HPA"] = st.number_input(
             "Ambient pressure [hPa]",
-            min_value=800.0,
-            max_value=1100.0,
+            min_value=0.0,
+            max_value=2100.0,
             value=float(AMBIENT_PRES_HPA),
             step=1.0,
             format="%.0f",
@@ -4197,8 +4410,8 @@ with st.sidebar:
 
         st.session_state["AMBIENT_RHO"] = st.number_input(
             "Ambient air density ρ [kg/m³]",
-            min_value=0.80,
-            max_value=1.35,
+            min_value=0.00,
+            max_value=2.35,
             value=float(AMBIENT_RHO),
             step=0.005,
             format="%.3f",
@@ -4210,8 +4423,8 @@ with st.sidebar:
 
         st.session_state["GRAVITY"] = st.number_input(
             "Gravity [m/s²]",
-            min_value=9.0,
-            max_value=10.0,
+            min_value=0.0,
+            max_value=20.0,
             value=DEFAULT_G,
             step=0.0001,
             format="%.4f",
@@ -4237,7 +4450,7 @@ with st.sidebar:
         )
         st.session_state["MAX_PWR"] = st.number_input(
             "Max power [W]",
-            min_value=100.0,
+            min_value=50.0,
             max_value=3000.0,
             value=float(DEFAULT_MAX_PWR),
             step=50.0,
@@ -4261,7 +4474,7 @@ with st.sidebar:
         )
         st.session_state["COMBINE_BREAK_MAX_TIME_DIFF"] = st.number_input(
             "Combine Breaks within [min]",
-            min_value=1.0,
+            min_value=0.0,
             max_value=60.0,
             value=float(DEFAULT_COMBINE_BREAK_MAX_TIME_DIFF),
             step=1.0,
@@ -4269,7 +4482,7 @@ with st.sidebar:
         )
         st.session_state["COMBINE_BREAK_MAX_DISTANCE"] = st.number_input(
             "Combine Breaks within [m]",
-            min_value=1.0,
+            min_value=0.0,
             max_value=1000.0,
             value=float(DEFAULT_COMBINE_BREAK_MAX_DISTANCE),
             step=1.0,
@@ -4293,7 +4506,7 @@ with st.sidebar:
         )
         st.session_state["CLIMB_END_AVERAGE_GRADE_PCT"] = st.number_input(
             "Max grade at climb end [%]",
-            min_value=0.0,
+            min_value=-float(MAX_GRADE),
             max_value=float(MAX_GRADE),
             value=float(DEFAULT_CLIMB_END_AVERAGE_GRADE_PCT),
             step=0.1,
@@ -4309,7 +4522,7 @@ with st.sidebar:
         )
         st.session_state["MAX_DIST_BETWEEN_CLIMBS_M"] = st.number_input(
             "Combine Climbs within [m]",
-            min_value=1.0,
+            min_value=0.0,
             max_value=1000.0,
             value=float(DEFAULT_MAX_DIST_BETWEEN_CLIMBS_M),
             step=1.0,
@@ -4337,8 +4550,8 @@ with st.sidebar:
     with st.expander("Human Body Model", expanded=False):
         st.session_state["EFFICIENCY"] = st.number_input(
             "Human Body Efficiency [-]",
-            min_value=0.05,
-            max_value=0.4,
+            min_value=0.01,
+            max_value=1.,
             value=float(DEFAULT_HUMAN_BODY_EFFICIENCY),
             step=0.01,
             format="%.3f",
@@ -4346,8 +4559,8 @@ with st.sidebar:
         )
         st.session_state["BASE_MET_DURING_ACTIVITY"] = st.number_input(
             "Base MET [-]",
-            min_value=1.0,
-            max_value=2.0,
+            min_value=0.0,
+            max_value=3.0,
             value=float(DEFAULT_BASE_MET_DURING_ACTIVITY),
             step=0.05,
             format="%.2f",
@@ -4366,8 +4579,8 @@ with st.sidebar:
 
         st.session_state["wheel_circ"] = st.number_input(
             "Wheel circumference [m]",
-            min_value=1.5,
-            max_value=2.8,
+            min_value=0.1,
+            max_value=5.,
             value=2.096,
             step=0.001,
             format="%.3f",
@@ -4376,21 +4589,11 @@ with st.sidebar:
         st.session_state["drivetrain_loss"] = st.number_input(
             "Drivetrain loss [-]",
             min_value=0.0,
-            max_value=0.2,
+            max_value=1.,
             value=0.03,
             step=0.005,
             format="%.3f",
             help="Fractional drivetrain loss (0.03 = 3%).\n\nDefault: 0.030 [-]",
-        )
-
-        st.session_state["REFERENCE_CDA_VALUE"] = st.number_input(
-            "Reference CdA [m²]",
-            min_value=0.1,
-            max_value=1.5,
-            value=float(DEFAULT_REFERENCE_CDA_VALUE),
-            step=0.01,
-            format="%.7f",
-            help=f"Reference CdA value used for aerodynamic drag.\n\nDefault: {DEFAULT_REFERENCE_CDA_VALUE:.7f} m²",
         )
 
         st.session_state["MAX_MAP_POINTS"] = st.number_input(
@@ -4422,7 +4625,7 @@ with st.sidebar:
         st.session_state["BRAKE_PERFORATION_FACTOR"] = st.number_input(
             "Brake perforation factor [-]",
             min_value=0.0,
-            max_value=1.0,
+            max_value=0.99,
             value=float(DEFAULT_BRAKE_PERFORATION_FACTOR),
             step=0.025,
             format="%.3f",
@@ -4743,3 +4946,9 @@ if key and key in st.session_state["results"]:
 
 else:
     st.info("Select a file and click 'Analyze selected files' first.")
+
+    lines = st.session_state.get("log_lines", [])
+    if not lines:
+        st.info("Log is empty.")
+    else:
+        st.info("\n".join(lines[-400:]))
