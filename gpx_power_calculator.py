@@ -7,10 +7,11 @@ import math
 import copy
 import tempfile
 import random
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, timezone
 import datetime as dt
+from io import BytesIO
 from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, field, asdict, is_dataclass
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -22,29 +23,36 @@ from meteostat import Hourly, Point
 import streamlit as st
 
 import folium
-import branca.colormap as cm
+import branca.colormap as cmap
 
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
+import plotly.colors as pc
 
 from scipy.ndimage import median_filter
 
 from zoneinfo import ZoneInfo
-
 try:
     from tzfpy import get_tz
 except Exception:
     get_tz = None
-from io import BytesIO
-import datetime as dt
-import re
-
 
 from PIL import Image as PILImage
-from reportlab.platypus import PageBreak
-from dataclasses import dataclass, field, asdict, is_dataclass
-from typing import Dict, Any
+
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.units import cm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Image,
+    Table,
+    TableStyle,
+    PageBreak,
+)
+from reportlab.lib import colors
 
 
 
@@ -155,7 +163,6 @@ def _to_jsonable(obj, max_len=220):
     Make values safe for ReportLab tables: short strings, no numpy scalars/arrays,
     and handle datetime nicely.
     """
-    import datetime as dt
 
     if obj is None:
         return "-"
@@ -237,7 +244,6 @@ def cfg_to_kv_rows(cfg):
     return [["cfg", _to_jsonable(cfg)]]
 
 def _force_colorway(fig):
-    import plotly.colors as pc
     # Plotly default qualitative palette
     fig.update_layout(
         template="plotly_white",
@@ -259,7 +265,6 @@ def _fig_to_png_bytes(fig, width=1200, height=800, scale=2):
             width=width,
             height=height,
             scale=scale,
-            engine="kaleido",
             validate=False,
         )
         return png
@@ -280,20 +285,15 @@ def build_pdf_report_bytes(
     """
     Create a PDF report as bytes (no filesystem required).
     """
-    from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.lib.units import cm
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
-    from reportlab.lib import colors
 
     buf = BytesIO()
     doc = SimpleDocTemplate(
         buf,
         pagesize=landscape(A4),
-        leftMargin=1.5 * cm,
-        rightMargin=1.5 * cm,
-        topMargin=1.4 * cm,
-        bottomMargin=1.4 * cm,
+        leftMargin=1.1 * cm,
+        rightMargin=1.1 * cm,
+        topMargin=1.3 * cm,
+        bottomMargin=1.1 * cm,
         title=f"GPX Report - {ride_name}",
         author="GPX Bike Tour Analyzer",
     )
@@ -518,7 +518,6 @@ def utc_to_local_from_gps(dt_utc: datetime, lat: float, lon: float, fallback_tz:
     """
     if dt_utc.tzinfo is None:
         # treat as UTC if naive
-        from datetime import timezone
         dt_utc = dt_utc.replace(tzinfo=timezone.utc)
 
     tzname = None
@@ -4763,8 +4762,11 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
         if vals is None or vals.size < 2 or np.nanmin(vals) == np.nanmax(vals):
             folium.PolyLine(positions, color="blue", weight=3, opacity=0.9).add_to(m)
         else:
-            vmin, vmax = float(np.nanmin(vals)), float(np.nanmax(vals))
-            colormap = cm.linear.viridis.scale(vmin, vmax)
+            vmin = float(np.nanmin(vals))
+            vmax = float(np.nanmax(vals))
+
+            colormap = cmap.linear.viridis.scale(vmin, vmax)
+
             if caption:
                 colormap.caption = caption
             colormap.add_to(m)
