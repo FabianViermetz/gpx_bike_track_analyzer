@@ -5,7 +5,7 @@ pandas
 
 gpxpy
 geopy
-meteostat==1.6.7
+meteostat==1.7.6
 
 
 folium
