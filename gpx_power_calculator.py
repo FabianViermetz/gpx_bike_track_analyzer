@@ -54,6 +54,7 @@ from reportlab.platypus import (
 )
 from reportlab.lib import colors
 
+import fitparse
 
 
 FIX_TIME_ZONE = True
@@ -101,7 +102,12 @@ DEFAULT_BRAKE_REAR_DIAMETER_MM, BRAKE_REAR_DIAMETER_MM = 160., 160.             
 DEFAULT_BRAKE_ADD_COOLING_FACTOR, BRAKE_ADD_COOLING_FACTOR = 0.3, 0.3             # empirical cooling factor -> 30% additional cooling area (much higher for icetech rotors)
 DEFAULT_BRAKE_PERFORATION_FACTOR, BRAKE_PERFORATION_FACTOR = 0.3, 0.3          # fraction of rotor area that is holes (30% typical)
 
-DEFAULT_SMOOTHING_WINDOW_SIZE_S, SMOOTHING_WINDOW_SIZE_S = 3., 3.  # meters
+SMOOTHING_WINDOW_SIZE_S = 3., 3.  # s
+SMOOTHING_WINDOW_SIZE__ALT_S = 9., 9.  # s
+SMOOTHING_WINDOW_SIZE_S_GPX_TCX = 3.0  # s
+SMOOTHING_WINDOW_SIZE_S_FIT = 1.0  # s
+SMOOTHING_WINDOW_SIZE_ALT_S_GPX_TCX = 6.0  # s
+SMOOTHING_WINDOW_SIZE_ALT_S_FIT = 5.0  # s
 
 DEFAULT_REFERENCE_ROLLING_LOSS,REFERENCE_ROLLING_LOSS = 13.7, 13.7 # Continental Grand Prix TR 28; watts according to https://www.bicyclerollingresistance.com calculation based on 18mph, 94lbs
 REFERENCE_LOAD_FOR_CRR_KG = 42.6376827 
@@ -123,9 +129,11 @@ SEGMENT_MEAN_MODE = False  # global/module-level toggle
 OVERRIDE_RIDE_START_DATETIME = dt_local = dt.datetime.combine(dt.date.today(), dt.time(9, 0))
 USE_DATETIME_OVERRIDE = False
 
-DEFAULT_TIRE_WEIGHT_G = 250.
+DEFAULT_TIRE_WEIGHT_G = 400.
 DEFAULT_TUBE_WEIGHT_G = 100.
-DEFAULT_RIM_WEIGHT_G = 450.
+DEFAULT_RIM_WEIGHT_G = 550.
+
+DROPS_DRAG_REDUCTION = 0.2  # drag reduction when riding in drops position
 
 details_lines = []
 
@@ -142,6 +150,7 @@ class RiderBikeConfig:
     front_der_teeth: list
     rear_der_teeth: list
     draft_effect: float       # dimensionless multiplier (<1 when drafting)
+    high_speed_aero_threshold_kmh: float
     draft_effect_dh: float       # dimensionless multiplier (<1 when drafting)
     draft_effect_uh: float       # dimensionless multiplier (<1 when drafting)
     tire_weight_g: float       
@@ -605,6 +614,33 @@ def hampel_fast(x, window_size=5, n_sigmas=3.0):
     x_filt[outliers] = med[outliers]
     return x_filt
 
+def lowpass_ema(x, alpha):
+    """
+    First-order low-pass filter (exponential moving average).
+
+    Parameters
+    ----------
+    x : array_like
+        Input signal
+    alpha : float
+        Smoothing factor in (0, 1].
+        Smaller -> stronger smoothing.
+        alpha ≈ dt / (tau + dt)
+
+    Returns
+    -------
+    y : ndarray
+        Filtered signal
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.empty_like(x)
+
+    y[0] = x[0]
+    for i in range(1, len(x)):
+        y[i] = alpha * x[i] + (1.0 - alpha) * y[i - 1]
+
+    return y
+
 def moving_average(data, window_size):
     data = np.asarray(data, dtype=float)
     if data.size == 0 or window_size <= 1:
@@ -673,7 +709,7 @@ def compute_disk_temperature(ambient_temp_c, speed_kph, headwind, brake_power_w,
         E_disk_J = disk_f_temps_K[-1] * disk_f_heat_capacity_J_per_K
         dT = disk_f_temps_K[-1] - (t_amb + 273.15)
         P_cool_W = disk_f_convection_W_per_K(v_kph/3.6) * dT
-        E_disk_J += (-p_brake_w * (BRAKE_DISTRIBUTION_FRONT) - P_cool_W) * dt_s
+        E_disk_J += (-p_brake_w * (BRAKE_DISTRIBUTION_FRONT) - P_cool_W) * min(dt_s,2.)
         T_new_K = E_disk_J / disk_f_heat_capacity_J_per_K
         if T_new_K < (t_amb + 273.15):
             T_new_K = t_amb + 273.15
@@ -683,7 +719,7 @@ def compute_disk_temperature(ambient_temp_c, speed_kph, headwind, brake_power_w,
         E_disk_J = disk_r_temps_K[-1] * disk_r_heat_capacity_J_per_K
         dT = disk_r_temps_K[-1] - (t_amb + 273.15)
         P_cool_W = disk_r_convection_W_per_K(v_kph/3.6) * dT
-        E_disk_J += (-p_brake_w * (1-BRAKE_DISTRIBUTION_FRONT) - P_cool_W) * dt_s
+        E_disk_J += (-p_brake_w * (1-BRAKE_DISTRIBUTION_FRONT) - P_cool_W) * min(dt_s,2.)
         T_new_K = E_disk_J / disk_r_heat_capacity_J_per_K
         if T_new_K < (t_amb + 273.15):
             T_new_K = t_amb + 273.15
@@ -741,26 +777,31 @@ def air_density_from_meteostat(temp_c, pres_hpa, rh_percent):
     rho = (p_d / (Rd * T)) + (p_v / (Rv * T))
     return rho
 
-
-def get_meteostat_series(latitudes, longitudes, times, use_wind_data=True):
+def get_meteostat_series(latitudes, longitudes, times,
+                         use_ambient_data=True,
+                         use_wind_data=False):
     """
     Returns per-time arrays for the given GPX times:
     dict with keys: 'wspd_ms', 'wdir_deg', 'temp_c', 'pres_hpa', 'rhum_pct', 'rho'
     All arrays have len(times).
-    Weather is taken from a single Meteostat point (midpoint of track) but time-aligned.
+
+    Weather is taken from a single Meteostat point (midpoint of track).
+    Wind data is only used if use_wind_data=True.
     """
     idx = pd.to_datetime(times)
 
-    if not use_wind_data:
-        print("Wind data disabled, using defaults & standard density.")
+    # ------------------------------------------------------------
+    # Full fallback: no ambient data at all
+    # ------------------------------------------------------------
+    if not use_ambient_data:
         n = len(times)
         return {
-            "wspd_ms": np.full(n, AMBIENT_WIND_SPEED_MS),
+            "wspd_ms":  np.full(n, AMBIENT_WIND_SPEED_MS),
             "wdir_deg": np.full(n, AMBIENT_WIND_DIR_DEG),
-            "temp_c":  np.full(n, AMBIENT_TEMP_C),
+            "temp_c":   np.full(n, AMBIENT_TEMP_C),
             "pres_hpa": np.full(n, AMBIENT_PRES_HPA),
             "rhum_pct": np.full(n, AMBIENT_RHUM_PCT),
-            "rho":     np.full(n, AMBIENT_RHO),
+            "rho":      np.full(n, AMBIENT_RHO),
         }
 
     mid_lat = float(np.mean(latitudes))
@@ -770,13 +811,23 @@ def get_meteostat_series(latitudes, longitudes, times, use_wind_data=True):
     start = min(times).replace(tzinfo=None) - timedelta(hours=1)
     end   = max(times).replace(tzinfo=None) + timedelta(hours=1)
 
-    print(f"Fetching Meteostat weather data for {mid_lat:.4f}, {mid_lon:.4f} from {start} to {end}...")
+    print(
+        f"Fetching Meteostat data for {mid_lat:.4f}, {mid_lon:.4f} "
+        f"from {start} to {end} "
+        f"(wind={'on' if use_wind_data else 'off'})"
+    )
 
     try:
         data = Hourly(point, start, end)
         df = data.fetch()
 
-        required = ['temp', 'pres', 'rhum', 'wspd', 'wdir']
+        # ------------------------------------------------------------
+        # Required columns depend on wind usage
+        # ------------------------------------------------------------
+        required = ['temp', 'pres', 'rhum']
+        if use_wind_data:
+            required += ['wspd', 'wdir']
+
         for col in required:
             if col not in df.columns:
                 raise ValueError(f"Meteostat data missing column '{col}'")
@@ -784,53 +835,68 @@ def get_meteostat_series(latitudes, longitudes, times, use_wind_data=True):
         for col in required:
             df[col] = df[col].ffill().bfill()
 
-        df['rho'] = air_density_from_meteostat(df['temp'], df['pres'], df['rhum'])
+        # Density always derived from thermodynamic state
+        df['rho'] = air_density_from_meteostat(
+            df['temp'], df['pres'], df['rhum']
+        )
+
         df.index = pd.to_datetime(df.index)
 
-        wspd_ms = []
-        wdir_deg = []
-        temp_c = []
-        pres_hpa = []
-        rhum_pct = []
-        rho = []
+        wspd_ms   = []
+        wdir_deg  = []
+        temp_c    = []
+        pres_hpa  = []
+        rhum_pct  = []
+        rho       = []
 
         for t in idx:
             if t < df.index[0] or t > df.index[-1]:
-                # outside available data range -> fallback
-                wspd_ms.append(0.0)
-                wdir_deg.append(0.0)
+                # Outside Meteostat coverage
                 temp_c.append(15.0)
                 pres_hpa.append(1013.0)
                 rhum_pct.append(50.0)
                 rho.append(1.225)
+
+                if use_wind_data:
+                    wspd_ms.append(0.0)
+                    wdir_deg.append(0.0)
+                else:
+                    wspd_ms.append(AMBIENT_WIND_SPEED_MS)
+                    wdir_deg.append(AMBIENT_WIND_DIR_DEG)
             else:
                 row = df.loc[:t].iloc[-1]
-                wspd_ms.append(row['wspd'] / 3.6)  # km/h -> m/s
-                wdir_deg.append(row['wdir'])
+
                 temp_c.append(row['temp'])
                 pres_hpa.append(row['pres'])
                 rhum_pct.append(row['rhum'])
                 rho.append(row['rho'])
 
+                if use_wind_data:
+                    wspd_ms.append(row['wspd'] / 3.6)  # km/h → m/s
+                    wdir_deg.append(row['wdir'])
+                else:
+                    wspd_ms.append(AMBIENT_WIND_SPEED_MS)
+                    wdir_deg.append(AMBIENT_WIND_DIR_DEG)
+
         return {
-            "wspd_ms": np.array(wspd_ms),
+            "wspd_ms":  np.array(wspd_ms),
             "wdir_deg": np.array(wdir_deg),
-            "temp_c":  np.array(temp_c),
+            "temp_c":   np.array(temp_c),
             "pres_hpa": np.array(pres_hpa),
             "rhum_pct": np.array(rhum_pct),
-            "rho":     np.array(rho),
+            "rho":      np.array(rho),
         }
 
     except Exception as e:
         print(f"Warning: failed to fetch Meteostat data ({e}). Using defaults.")
         n = len(times)
         return {
-            "wspd_ms": np.zeros(n),
-            "wdir_deg": np.zeros(n),
-            "temp_c":  np.full(n, 20.0),
+            "wspd_ms":  np.full(n, AMBIENT_WIND_SPEED_MS),
+            "wdir_deg": np.full(n, AMBIENT_WIND_DIR_DEG),
+            "temp_c":   np.full(n, 20.0),
             "pres_hpa": np.full(n, 1013.0),
             "rhum_pct": np.full(n, 50.0),
-            "rho":     np.full(n, 1.225),
+            "rho":      np.full(n, 1.225),
         }
 
 
@@ -877,8 +943,45 @@ def manage_front_gear(current_front, current_rear, wheel_rpm, front_teeth_list, 
             return front_teeth_list[front_idx + 1]
     return current_front
 
+def interp_with_gap_zero(new_t, t, y, gap_s=10.0, fill_value=0.0):
+    """
+    Interpolate y(t) onto new_t, but if new_t falls inside a gap in t larger than gap_s,
+    force output to fill_value (e.g. 0 for speed during autopause gaps).
 
-def compute_power(speed, acc, grade, wind_speed, cfg: RiderBikeConfig, rho_air, ride_type):
+    Assumes t and new_t are in seconds (float) or anything numeric in the same unit.
+    """
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    new_t = np.asarray(new_t, dtype=float)
+
+    # Basic sanity: require increasing t
+    order = np.argsort(t)
+    t = t[order]
+    y = y[order]
+
+    # Interpolate normally (outside bounds -> edge values by np.interp behavior)
+    yi = np.interp(new_t, t, y)
+
+    # Identify large gaps in the ORIGINAL sampling
+    dt = np.diff(t)
+    gap_idx = np.where(dt > gap_s)[0]  # gap between t[i] and t[i+1]
+
+    if gap_idx.size == 0:
+        return yi
+
+    # For each gap (t[i], t[i+1]), force any new_t strictly inside to fill_value
+    # Vectorized-ish approach: loop only over gaps (usually few)
+    for i in gap_idx:
+        t0, t1 = t[i], t[i+1]
+        mask = (new_t > t0) & (new_t < t1)
+        yi[mask] = fill_value
+
+    return yi
+
+# usage
+# speeds_interp = interp_with_gap_zero(new_timestamps, timestamps, speeds, gap_s=8.0, fill_value=0.0)
+
+def compute_power(speed, acc, grade, wind_speed, cfg: RiderBikeConfig, rho_air, slope_type):
     """
     speed: m/s, wind_speed: m/s, grade: dz/dx, angles in degrees, rho_air: kg/m³.
     """
@@ -888,12 +991,16 @@ def compute_power(speed, acc, grade, wind_speed, cfg: RiderBikeConfig, rho_air, 
     slope_angle = math.atan(grade)
     v_rel = speed + wind_speed
 
-    if ride_type == "climb":
+    high_speed_draft_factor = DROPS_DRAG_REDUCTION if speed * 3.6 >= cfg.high_speed_aero_threshold_kmh else 0.0
+    if slope_type == "climb":
         local_draft_factor = cfg.draft_effect_uh
-    elif ride_type == "downhill":
+    elif slope_type == "downhill":
         local_draft_factor = cfg.draft_effect_dh
     else:
         local_draft_factor = cfg.draft_effect
+
+    high_speed_draft_factor = DROPS_DRAG_REDUCTION if speed * 3.6 >= cfg.high_speed_aero_threshold_kmh else 0.0
+    local_draft_factor *= (1.0 - high_speed_draft_factor)
 
     wheel_radius_m = cfg.wheel_circumference / 2. / np.pi
 
@@ -1845,7 +1952,7 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
     with open(gpx_path, 'r') as gpx_file:
         gpx = gpxpy.parse(gpx_file)
 
-    lats, lons, raw_alts, dists, times, speeds = [], [], [], [], [], []
+    lats, lons, raw_alts, dists, times, speeds, bearings_degs = [], [], [], [], [], [], []
     hr_raw, cad_raw, pwr_raw, temp_dev_raw = [], [], [], []
     prev_point = None
     prev_time = None
@@ -1857,6 +1964,9 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
     track_tzinfo = None          # determine once for whole track
     prev_time_utc = None
     # ----------------------------------------------
+
+
+
 
     for track in gpx.tracks:
         for segment in track.segments:
@@ -1917,6 +2027,9 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
                         (point.latitude, point.longitude)
                     ).meters
 
+                    bearings_deg = compute_bearing(prev_point.latitude, prev_point.longitude, point.latitude, point.longitude)
+                
+
                     # IMPORTANT: always use UTC for dt
                     time_diff = (times[-1] - prev_time).total_seconds()
                     if time_diff <= 0:
@@ -1925,9 +2038,12 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
                     speed = dist / time_diff
                     speeds.append(speed * 3.6)
                     dists.append(dist / 1000.0)
+                    bearings_degs.append(bearings_deg)
+                    
                 else:
                     speeds.append(0.0)
                     dists.append(0.0)
+                    bearings_degs.append(0.0)
 
                 prev_point = point
                 prev_time = times[-1]  # UTC
@@ -1989,6 +2105,7 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
     temp_dev_raw = temp_dev_raw[cut_beginning:cut_end-1]
     speeds = speeds[cut_beginning:cut_end-1]
     dists = dists[cut_beginning:cut_end-1]
+    bearings_degs = bearings_degs[cut_beginning:cut_end-1]
     
 
 
@@ -2009,8 +2126,9 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
         lats = np.interp(new_timestamps, timestamps, lats)
         lons = np.interp(new_timestamps, timestamps, lons)
         raw_alts = np.interp(new_timestamps, timestamps, raw_alts)
-        speeds = np.interp(new_timestamps, timestamps, speeds)
+        speeds = interp_with_gap_zero(new_timestamps, timestamps, speeds, gap_s=240.0, fill_value=0.0)
         dspeed = np.diff(speeds)
+        bearings_degs = np.interp(new_timestamps, timestamps, bearings_degs)
         for i in range(2,len(speeds)-2):
             if np.abs(dspeed[i]) > 5 and np.abs(dspeed[i+1]) > 5:
                 speeds[i] = (speeds[i] + speeds[i-2])/2.
@@ -2056,6 +2174,660 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
         "lons": np.array(lons),
         "raw_alts": np.array(raw_alts),
         "dists": np.array(dists),
+        "bearings_degs": np.array(bearings_degs),
+        "total_dists": np.array(total_dists),
+        "times": np.array(times, dtype=object),
+        "speeds_kph": np.array(speeds),
+        "hr_series": np.array(hr_series),
+        "cad_series": np.array(cad_series),
+        "pow_series": np.array(pow_series),
+        "temp_dev_series": np.array(temp_dev_series),
+        "start_time": start_time,
+        "end_time": end_time,
+        "timestep_min": timestep_min,
+        "times_local_display": times_local_display,
+    }
+
+def _parse_and_interpolate_tcx(tcx_path, progress_cb=None):
+    """Parse TCX, extract sensors, resample to 1 Hz, and build distance arrays (GPX-compatible output)."""
+    def _report(pct, text):
+        if progress_cb is not None:
+            progress_cb(int(pct), text)
+
+    _report(0, "Parsing TCX file...")
+    print(f"\n=== Analyzing file: {tcx_path} ===")
+
+    import xml.etree.ElementTree as ET
+    from datetime import datetime, timezone, timedelta
+
+    # ---------------------------- helpers ----------------------------
+
+    def _strip_ns(tag: str) -> str:
+        # "{namespace}Tag" -> "Tag"
+        return tag.split("}", 1)[1] if "}" in tag else tag
+
+    def _find_child(parent, *names):
+        """Return first direct child whose localname matches one of names."""
+        if parent is None:
+            return None
+        for ch in list(parent):
+            if _strip_ns(ch.tag) in names:
+                return ch
+        return None
+
+    def _find_text(parent, *names):
+        ch = _find_child(parent, *names)
+        if ch is None or ch.text is None:
+            return None
+        s = ch.text.strip()
+        return s if s != "" else None
+
+    def _parse_time_iso8601(s: str):
+        # TCX usually uses e.g. "2025-01-01T12:34:56Z" or "+00:00"
+        s = s.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except Exception:
+            # last-resort: try without timezone, then treat as UTC
+            dt = datetime.strptime(s.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+
+    def _safe_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    def _extract_tcx_sensors(trackpoint_elem):
+        """
+        Returns: (hr, cad, pwr, temp_dev)
+        - HR: <HeartRateBpm><Value>
+        - Cadence: <Cadence> (rpm)
+        - Power: common in Garmin extensions:
+            <Extensions>...<TPX>...<Watts> (or <ns3:Watts>)
+        - Temp: sometimes <TPX><Temp> or device-specific; try a few common tags.
+        """
+        hr_v = None
+        cad_v = None
+        pwr_v = None
+        temp_v = None
+
+        # HeartRateBpm/Value
+        hr_el = _find_child(trackpoint_elem, "HeartRateBpm")
+        if hr_el is not None:
+            hr_txt = _find_text(hr_el, "Value")
+            hr_v = _safe_float(hr_txt) if hr_txt is not None else None
+
+        # Cadence
+        cad_txt = _find_text(trackpoint_elem, "Cadence")
+        cad_v = _safe_float(cad_txt) if cad_txt is not None else None
+
+        # Extensions: search recursively for likely power/temp tags
+        ext_el = _find_child(trackpoint_elem, "Extensions")
+        if ext_el is not None:
+            # Walk all descendants; match local tag names
+            for el in ext_el.iter():
+                name = _strip_ns(el.tag)
+                if el.text is None:
+                    continue
+                txt = el.text.strip()
+                if txt == "":
+                    continue
+
+                if pwr_v is None and name in ("Watts", "Power", "ns3:Watts"):
+                    pwr_v = _safe_float(txt)
+                    continue
+
+                if temp_v is None and name in ("Temp", "Temperature", "AirTemp", "BikeTemp", "DeviceTemp"):
+                    temp_v = _safe_float(txt)
+                    continue
+
+        return hr_v, cad_v, pwr_v, temp_v
+
+    # ---------------------------- parse TCX ----------------------------
+
+    tree = ET.parse(tcx_path)
+    root = tree.getroot()
+
+    lats, lons, raw_alts, dists, times, speeds, bearings_degs = [], [], [], [], [], [], []
+    hr_raw, cad_raw, pwr_raw, temp_dev_raw = [], [], [], []
+    prev_lat = None
+    prev_lon = None
+    prev_time = None
+
+    # --- NEW: timezone-fix helpers/state (fixed) ---
+    times_utc_used = []          # authoritative timeline for computations
+    times_local_display = []     # only for UI / printing (optional)
+    track_tzinfo = None          # determine once for whole track
+    prev_time_utc = None
+    # ----------------------------------------------
+
+    # Iterate all Trackpoint elements anywhere under Activities/Activity/Lap/Track
+    # (robust to slightly different structures)
+    for tp in root.iter():
+        if _strip_ns(tp.tag) != "Trackpoint":
+            continue
+
+        time_txt = _find_text(tp, "Time")
+        if time_txt is None:
+            continue
+
+        # Position
+        pos = _find_child(tp, "Position")
+        lat_txt = _find_text(pos, "LatitudeDegrees") if pos is not None else None
+        lon_txt = _find_text(pos, "LongitudeDegrees") if pos is not None else None
+
+        lat = _safe_float(lat_txt) if lat_txt is not None else None
+        lon = _safe_float(lon_txt) if lon_txt is not None else None
+
+        # Some TCX points may omit position; skip those to keep arrays aligned for geo metrics
+        if lat is None or lon is None:
+            continue
+
+        alt_txt = _find_text(tp, "AltitudeMeters")
+        alt = _safe_float(alt_txt) if alt_txt is not None else None
+
+        lats.append(lat)
+        lons.append(lon)
+        raw_alts.append(alt if alt is not None else np.nan)
+
+        # ---------- time handling (robust) ----------
+        dt_utc = _parse_time_iso8601(time_txt)
+
+        # enforce strictly increasing UTC (protect speed/resampling)
+        if prev_time_utc is not None and dt_utc <= prev_time_utc:
+            dt_utc = prev_time_utc + timedelta(seconds=1)
+
+        prev_time_utc = dt_utc
+        times_utc_used.append(dt_utc)
+
+        # what you store in `times` should be UTC for all calculations
+        times.append(dt_utc)
+
+        # optional: compute local time for display only
+        if FIX_TIME_ZONE:
+            try:
+                if track_tzinfo is None:
+                    # determine tz once from first valid point/time
+                    dt_local_first = utc_to_local_from_gps(dt_utc, float(lat), float(lon))
+                    track_tzinfo = dt_local_first.tzinfo
+
+                if track_tzinfo is not None:
+                    times_local_display.append(dt_utc.astimezone(track_tzinfo))
+                else:
+                    times_local_display.append(dt_utc)
+            except Exception:
+                times_local_display.append(dt_utc)
+        # --------------------------------------------
+
+        # sensors
+        hr_v, cad_v, pwr_v, temp_v = _extract_tcx_sensors(tp)
+        hr_raw.append(hr_v)
+        cad_raw.append(cad_v)
+        pwr_raw.append(pwr_v)
+        temp_dev_raw.append(temp_v)
+
+        # metrics between points
+        if prev_lat is not None and prev_lon is not None and prev_time is not None:
+            dist_m = geodesic((prev_lat, prev_lon), (lat, lon)).meters
+            bearing_deg = compute_bearing(prev_lat, prev_lon, lat, lon)
+
+            time_diff = (times[-1] - prev_time).total_seconds()
+            if time_diff <= 0:
+                time_diff = 1.0  # safety; should be rare due to monotonic clamp
+
+            speed = dist_m / time_diff
+            speeds.append(speed * 3.6)
+            dists.append(dist_m / 1000.0)
+            bearings_degs.append(bearing_deg)
+        else:
+            speeds.append(0.0)
+            dists.append(0.0)
+            bearings_degs.append(0.0)
+
+        prev_lat = lat
+        prev_lon = lon
+        prev_time = times[-1]  # UTC
+
+    # -------------------------------------------------------------------------
+    # Optional: override ride start datetime (static offset applied to ALL points)
+    # Assumptions:
+    # - `times` is a list of aware UTC datetimes (as in your snippet)
+    # - `times_local_display` is for display only
+    # - `OVERRIDE_RIDE_START_DATETIME` is a naive LOCAL datetime chosen by user
+    # - `track_tzinfo` was determined from GPS (tzfpy/your utc_to_local_from_gps)
+    # -------------------------------------------------------------------------
+    if USE_DATETIME_OVERRIDE and len(times) > 0:
+        first_utc = times[0]  # aware UTC
+
+        # interpret user's override start as *local* at the ride location
+        # and convert it to UTC to get the desired first timestamp in UTC
+        try:
+            # best case: we know local tzinfo from GPS
+            if FIX_TIME_ZONE and (track_tzinfo is not None):
+                manual_local_aware = OVERRIDE_RIDE_START_DATETIME.replace(tzinfo=track_tzinfo)
+                manual_start_utc = manual_local_aware.astimezone(timezone.utc)
+            else:
+                # fallback: treat override as UTC if we cannot determine local tz
+                manual_start_utc = OVERRIDE_RIDE_START_DATETIME.replace(tzinfo=timezone.utc)
+
+            # constant shift so that first point matches manual start time
+            dt_shift = manual_start_utc - first_utc
+
+            # shift all UTC times
+            times = [t + dt_shift for t in times]
+
+            # rebuild display times consistently from shifted UTC
+            if FIX_TIME_ZONE and (track_tzinfo is not None):
+                times_local_display = [t.astimezone(track_tzinfo) for t in times]
+            else:
+                # if you don't have a tz, just show shifted UTC
+                times_local_display = list(times)
+
+        except Exception:
+            # if anything goes wrong, do NOT break the ride; just keep original times
+            pass
+    # -------------------------------------------------------------------------
+
+    cut_beginning = 0
+    cut_end = 0
+
+    # keep identical slicing behavior to your GPX function
+    lats = lats[cut_beginning:cut_end-1]
+    lons = lons[cut_beginning:cut_end-1]
+    raw_alts = raw_alts[cut_beginning:cut_end-1]
+    times = times[cut_beginning:cut_end-1]
+    times_local_display = times_local_display[cut_beginning:cut_end-1]
+    hr_raw = hr_raw[cut_beginning:cut_end-1]
+    cad_raw = cad_raw[cut_beginning:cut_end-1]
+    pwr_raw = pwr_raw[cut_beginning:cut_end-1]
+    temp_dev_raw = temp_dev_raw[cut_beginning:cut_end-1]
+    speeds = speeds[cut_beginning:cut_end-1]
+    dists = dists[cut_beginning:cut_end-1]
+    bearings_degs = bearings_degs[cut_beginning:cut_end-1]
+
+    if len(times) == 0:
+        raise ValueError("No time data found in TCX file.")
+
+    # match your behavior: make naive for interpolation
+    times = [t.replace(tzinfo=None) for t in times]
+    start_time = times[0]
+    end_time = times[-1]
+    _report(15, "Interpolating & smoothing...")
+
+    if len(times) > 1:
+        total_seconds = int((end_time - start_time).total_seconds())
+        new_times = [start_time + timedelta(seconds=i) for i in range(total_seconds + 1)]
+        timestamps = np.array([t.timestamp() for t in times])
+        new_timestamps = np.array([t.timestamp() for t in new_times])
+
+        lats = np.interp(new_timestamps, timestamps, lats)
+        lons = np.interp(new_timestamps, timestamps, lons)
+        raw_alts = np.interp(new_timestamps, timestamps, raw_alts)
+        speeds = np.interp(new_timestamps, timestamps, speeds)
+        dspeed = np.diff(speeds)
+        bearings_degs = np.interp(new_timestamps, timestamps, bearings_degs)
+        for i in range(2, len(speeds) - 2):
+            if np.abs(dspeed[i]) > 5 and np.abs(dspeed[i + 1]) > 5:
+                speeds[i] = (speeds[i] + speeds[i - 2]) / 2.0
+
+        def _interp_sensor(raw_list):
+            arr = np.asarray(raw_list, dtype=float)
+            mask = np.isfinite(arr)
+            if np.count_nonzero(mask) < 2:
+                return np.full_like(new_timestamps, np.nan, dtype=float)
+            return np.interp(new_timestamps, timestamps[mask], arr[mask])
+
+        hr_series = _interp_sensor(hr_raw)
+        cad_series = _interp_sensor(cad_raw)
+        pow_series = _interp_sensor(pwr_raw)
+        temp_dev_series = _interp_sensor(temp_dev_raw)
+
+        times = new_times
+
+        total_dists = []
+        total_dist = 0.0
+        for d in dists:
+            total_dist += d
+            total_dists.append(total_dist)
+        total_dists = np.interp(new_timestamps, timestamps, total_dists)
+        dists = []
+        last_dist = total_dists[0]
+        for d in total_dists:
+            dists.append(d - last_dist)
+            last_dist = d
+    else:
+        hr_series = np.array(hr_raw, dtype=float)
+        cad_series = np.array(cad_raw, dtype=float)
+        pow_series = np.array(pwr_raw, dtype=float)
+        temp_dev_series = np.array(temp_dev_raw, dtype=float)
+        total_dists = np.array(dists, dtype=float)
+
+    # timestep in minutes
+    timestep_min = np.median(np.diff([t.timestamp() for t in times])) / 60.0
+
+    return {
+        "gpx_path": tcx_path,  # keep key name to stay compatible downstream
+        "lats": np.array(lats),
+        "lons": np.array(lons),
+        "raw_alts": np.array(raw_alts),
+        "dists": np.array(dists),
+        "bearings_degs": np.array(bearings_degs),
+        "total_dists": np.array(total_dists),
+        "times": np.array(times, dtype=object),
+        "speeds_kph": np.array(speeds),
+        "hr_series": np.array(hr_series),
+        "cad_series": np.array(cad_series),
+        "pow_series": np.array(pow_series),
+        "temp_dev_series": np.array(temp_dev_series),
+        "start_time": start_time,
+        "end_time": end_time,
+        "timestep_min": timestep_min,
+        "times_local_display": times_local_display,
+    }
+
+def _parse_and_interpolate_fit(fit_path, progress_cb=None):
+    """Parse FIT, extract sensors, resample to 1 Hz, and build distance arrays (GPX-compatible output).
+    Prefers enhanced_* channels where available and uses FIT 'distance' when present.
+    """
+    def _report(pct, text):
+        if progress_cb is not None:
+            progress_cb(int(pct), text)
+
+    _report(0, "Parsing FIT file...")
+    print(f"\n=== Analyzing file: {fit_path} ===")
+
+    try:
+        from fitparse import FitFile
+    except Exception as e:
+        raise ImportError(
+            "Reading FIT requires the 'fitparse' package. Install via: pip install fitparse"
+        ) from e
+
+    from datetime import timezone, timedelta
+    import datetime as dt
+    import numpy as np
+
+    SEMICIRCLES_TO_DEG = 180.0 / (2**31)
+
+    def _to_deg_from_semicircles(v):
+        try:
+            if v is None:
+                return None
+            return float(v) * SEMICIRCLES_TO_DEG
+        except Exception:
+            return None
+
+    def _to_float(v):
+        try:
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _to_utc_aware(ts):
+        if ts is None:
+            return None
+        if isinstance(ts, dt.datetime):
+            if ts.tzinfo is None:
+                return ts.replace(tzinfo=timezone.utc)
+            return ts.astimezone(timezone.utc)
+        return None
+
+    def _prefer(fields_dict, keys):
+        """Return the first non-None value among keys."""
+        for k in keys:
+            if k in fields_dict:
+                v = fields_dict.get(k)
+                if v is not None:
+                    return v
+        return None
+
+    fit = FitFile(fit_path)
+
+    lats, lons, raw_alts, dists, times, speeds, bearings_degs = [], [], [], [], [], [], []
+    hr_raw, cad_raw, pwr_raw, temp_dev_raw = [], [], [], []
+    prev_lat = None
+    prev_lon = None
+    prev_time = None
+
+    # track-based distance (cumulative meters from device), preferred
+    dist_cum_m = []
+    prev_dist_cum_m = None
+
+    # --- timezone-fix helpers/state ---
+    times_utc_used = []
+    times_local_display = []
+    track_tzinfo = None
+    prev_time_utc = None
+    # --------------------------------
+
+    # Parse all record messages
+    for msg in fit.get_messages("record"):
+        # Collect fields into a dict (robust; avoids missing attribute edge cases)
+        fd = {}
+        for f in msg:
+            name = getattr(f, "name", None)
+            if not name:
+                continue
+            fd[name] = getattr(f, "value", None)
+
+        # --- timestamp ---
+        dt_utc = _to_utc_aware(fd.get("timestamp"))
+        if dt_utc is None:
+            continue
+
+        # enforce strictly increasing UTC
+        if prev_time_utc is not None and dt_utc <= prev_time_utc:
+            dt_utc = prev_time_utc + timedelta(seconds=1)
+        prev_time_utc = dt_utc
+        times_utc_used.append(dt_utc)
+        times.append(dt_utc)
+
+        # --- GPS position ---
+        lat = _to_deg_from_semicircles(fd.get("position_lat"))
+        lon = _to_deg_from_semicircles(fd.get("position_long"))
+
+        # Some records omit position (indoor, tunnels, paused samples).
+        # To keep your arrays aligned with time we *can* keep NaNs, but your pipeline expects valid lats/lons.
+        # So: if missing position, skip this record entirely.
+        if lat is None or lon is None:
+            # also roll back time append to keep arrays aligned
+            times.pop()
+            times_utc_used.pop()
+            prev_time_utc = times[-1].replace(tzinfo=timezone.utc) if len(times) > 0 and isinstance(times[-1], dt.datetime) else prev_time_utc
+            continue
+
+        lats.append(lat)
+        lons.append(lon)
+
+        # --- altitude (prefer enhanced) ---
+        alt_v = _prefer(fd, ["enhanced_altitude", "altitude"])
+        raw_alts.append(_to_float(alt_v) if alt_v is not None else np.nan)
+
+        # --- local display time (optional) ---
+        if FIX_TIME_ZONE:
+            try:
+                if track_tzinfo is None:
+                    dt_local_first = utc_to_local_from_gps(dt_utc, float(lat), float(lon))
+                    track_tzinfo = dt_local_first.tzinfo
+                if track_tzinfo is not None:
+                    times_local_display.append(dt_utc.astimezone(track_tzinfo))
+                else:
+                    times_local_display.append(dt_utc)
+            except Exception:
+                times_local_display.append(dt_utc)
+
+        # --- sensors ---
+        hr_raw.append(_to_float(fd.get("heart_rate")))
+        cad_raw.append(_to_float(fd.get("cadence")))
+        pwr_raw.append(_to_float(fd.get("power")))
+        temp_dev_raw.append(_to_float(_prefer(fd, ["temperature", "temp"])))
+
+        # --- speed (prefer enhanced) ---
+        # FIT speed is usually in m/s (fitparse returns numeric); we store km/h like your GPX
+        sp_ms = _prefer(fd, ["enhanced_speed", "speed"])
+        sp_ms = _to_float(sp_ms)
+
+        # --- distance (prefer FIT cumulative meters) ---
+        dc = _to_float(fd.get("distance"))  # cumulative meters (usually)
+        dist_cum_m.append(dc if dc is not None else np.nan)
+
+        # --- compute incremental distance + bearing + speed ---
+        if prev_lat is not None and prev_lon is not None and prev_time is not None:
+            # time diff
+            time_diff = (times[-1] - prev_time).total_seconds()
+            if time_diff <= 0:
+                time_diff = 0.01  # safety; should be rare due to monotonic clamp
+
+            bearing_deg = compute_bearing(prev_lat, prev_lon, lat, lon)
+
+            # incremental distance: best = delta of FIT cumulative distance if available & sane
+            dist_km = None
+            if dc is not None and prev_dist_cum_m is not None:
+                dd = dc - prev_dist_cum_m
+                # sanity: allow 0..500m per sample (covers > 1800 km/h as upper bound)
+                if dd >= 0.0 and dd <= 500.0:
+                    dist_km = dd / 1000.0
+
+            if dist_km is None:
+                # fallback: compute from GPS
+                dist_m = geodesic((prev_lat, prev_lon), (lat, lon)).meters
+                dist_km = dist_m / 1000.0
+
+            dists.append(dist_km)
+            bearings_degs.append(bearing_deg)
+
+            # speed: best = FIT speed channel if available, else from dist/time
+            if sp_ms is not None and np.isfinite(sp_ms) and time_diff < 10.:
+                speeds.append(sp_ms * 3.6)
+            else:
+                speeds.append((dist_km * 1000.0 / time_diff) * 3.6)
+        else:
+            speeds.append(0.0)
+            dists.append(0.0)
+            bearings_degs.append(0.0)
+
+        prev_lat = lat
+        prev_lon = lon
+        prev_time = times[-1]
+        prev_dist_cum_m = dc if dc is not None else prev_dist_cum_m
+
+    # -------------------------------------------------------------------------
+    # Optional: override ride start datetime (static offset applied to ALL points)
+    # -------------------------------------------------------------------------
+    if USE_DATETIME_OVERRIDE and len(times) > 0:
+        first_utc = times[0]  # aware UTC
+        try:
+            if FIX_TIME_ZONE and (track_tzinfo is not None):
+                manual_local_aware = OVERRIDE_RIDE_START_DATETIME.replace(tzinfo=track_tzinfo)
+                manual_start_utc = manual_local_aware.astimezone(timezone.utc)
+            else:
+                manual_start_utc = OVERRIDE_RIDE_START_DATETIME.replace(tzinfo=timezone.utc)
+
+            dt_shift = manual_start_utc - first_utc
+
+            times = [t + dt_shift for t in times]
+
+            if FIX_TIME_ZONE and (track_tzinfo is not None):
+                times_local_display = [t.astimezone(track_tzinfo) for t in times]
+            else:
+                times_local_display = list(times)
+        except Exception:
+            pass
+    # -------------------------------------------------------------------------
+
+    cut_beginning = 0
+    cut_end = 0
+
+    lats = lats[cut_beginning:cut_end-1]
+    lons = lons[cut_beginning:cut_end-1]
+    raw_alts = raw_alts[cut_beginning:cut_end-1]
+    times = times[cut_beginning:cut_end-1]
+    times_local_display = times_local_display[cut_beginning:cut_end-1]
+    hr_raw = hr_raw[cut_beginning:cut_end-1]
+    cad_raw = cad_raw[cut_beginning:cut_end-1]
+    pwr_raw = pwr_raw[cut_beginning:cut_end-1]
+    temp_dev_raw = temp_dev_raw[cut_beginning:cut_end-1]
+    speeds = speeds[cut_beginning:cut_end-1]
+    dists = dists[cut_beginning:cut_end-1]
+    bearings_degs = bearings_degs[cut_beginning:cut_end-1]
+
+    if len(times) == 0:
+        raise ValueError("No time data found in FIT file.")
+
+    # match your behavior: make naive for interpolation
+    times = [t.replace(tzinfo=None) for t in times]
+    start_time = times[0]
+    end_time = times[-1]
+    _report(15, "Interpolating & smoothing...")
+
+    if len(times) > 1:
+        total_seconds = int((end_time - start_time).total_seconds())
+        new_times = [start_time + timedelta(seconds=i) for i in range(total_seconds + 1)]
+        timestamps = np.array([t.timestamp() for t in times])
+        new_timestamps = np.array([t.timestamp() for t in new_times])
+
+        lats = np.interp(new_timestamps, timestamps, lats)
+        lons = np.interp(new_timestamps, timestamps, lons)
+        raw_alts = np.interp(new_timestamps, timestamps, raw_alts)
+        speeds = np.interp(new_timestamps, timestamps, speeds)
+        dspeed = np.diff(speeds)
+        bearings_degs = np.interp(new_timestamps, timestamps, bearings_degs)
+        for i in range(2, len(speeds) - 2):
+            if np.abs(dspeed[i]) > 5 and np.abs(dspeed[i + 1]) > 5:
+                speeds[i] = (speeds[i] + speeds[i - 2]) / 2.0
+
+        def _interp_sensor(raw_list):
+            arr = np.asarray(raw_list, dtype=float)
+            mask = np.isfinite(arr)
+            if np.count_nonzero(mask) < 2:
+                return np.full_like(new_timestamps, np.nan, dtype=float)
+            return np.interp(new_timestamps, timestamps[mask], arr[mask])
+
+        hr_series = _interp_sensor(hr_raw)
+        cad_series = _interp_sensor(cad_raw)
+        pow_series = _interp_sensor(pwr_raw)
+        temp_dev_series = _interp_sensor(temp_dev_raw)
+
+        times = new_times
+
+        # rebuild distance: we already have per-sample dists; integrate then interp
+        total_dists = []
+        total_dist = 0.0
+        for d in dists:
+            total_dist += d
+            total_dists.append(total_dist)
+
+        total_dists = np.interp(new_timestamps, timestamps, total_dists)
+
+        dists_new = []
+        last_dist = total_dists[0]
+        for d in total_dists:
+            dists_new.append(d - last_dist)
+            last_dist = d
+        dists = dists_new
+    else:
+        hr_series = np.array(hr_raw, dtype=float)
+        cad_series = np.array(cad_raw, dtype=float)
+        pow_series = np.array(pwr_raw, dtype=float)
+        temp_dev_series = np.array(temp_dev_raw, dtype=float)
+        total_dists = np.array(dists, dtype=float)
+
+    timestep_min = np.median(np.diff([t.timestamp() for t in times])) / 60.0
+
+    return {
+        "gpx_path": fit_path,  # keep key name to stay compatible downstream
+        "lats": np.array(lats),
+        "lons": np.array(lons),
+        "raw_alts": np.array(raw_alts),
+        "dists": np.array(dists),
+        "bearings_degs": np.array(bearings_degs),
         "total_dists": np.array(total_dists),
         "times": np.array(times, dtype=object),
         "speeds_kph": np.array(speeds),
@@ -2100,11 +2872,11 @@ def _smooth_and_grades(core):
 
     smoothed_total_dists = moving_average(total_dists, window_size=SMOOTHING_WINDOW_SIZE_S)
     smoothed_speeds_kph = moving_average(speeds_kph, window_size=SMOOTHING_WINDOW_SIZE_S)
-    smoothed_alts = moving_average(raw_alts, window_size=1)
+    smoothed_alts = moving_average(raw_alts, window_size=SMOOTHING_WINDOW_SIZE_ALT_S)
     smoothed_speeds_ms = smoothed_speeds_kph / 3.6
 
     grades = compute_grade_array(smoothed_alts, dists)
-    smoothed_grades = moving_average(grades, window_size=SMOOTHING_WINDOW_SIZE_S)
+    smoothed_grades = moving_average(grades, window_size=SMOOTHING_WINDOW_SIZE_ALT_S)
     grades_array = np.array(smoothed_grades)
 
     return {
@@ -2120,7 +2892,7 @@ def _smooth_and_grades(core):
     }
 
 
-def _weather_and_air_density(core, use_wind_data, progress_cb=None):
+def _weather_and_air_density(core, use_ambient_data, use_wind_data, progress_cb=None):
     """Fetch Meteostat weather along route and compute air density."""
     def _report(pct, text):
         if progress_cb is not None:
@@ -2132,11 +2904,13 @@ def _weather_and_air_density(core, use_wind_data, progress_cb=None):
     lons = core["lons"]
     times = core["times"]
 
-    weather = get_meteostat_series(lats, lons, times, use_wind_data=use_wind_data)
+    weather = get_meteostat_series(lats, lons, times, use_ambient_data=use_ambient_data, use_wind_data=use_wind_data)
     return weather
 
+def _wrap_deg180(a):
+    return (a + 180.0) % 360.0 - 180.0
 
-def _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_cb=None, simulate=False):
+def _headwind_and_power(core, smooth, slope_type_series, weather, cfg, progress_cb=None, simulate=False):
     """Compute headwind, acceleration, power, smoothed power, and brake power."""
 
     def _report(pct, text):
@@ -2190,45 +2964,36 @@ def _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_c
     # =========================
     # SIMULATE NEW TIMESTAMPS
     # =========================
+
+    
+    # distances between points (meters)
+    n = len(lats)
+    ds = [0.0] * n
+    for i in range(1, n):
+        ds[i] = geodesic((lats[i-1], lons[i-1]), (lats[i], lons[i])).meters
+        
+
     if simulate:
         # user-configurable knobs (put them into cfg if you prefer)
         P_TARGET_W = cfg.sim_power_W
         VMAX_DOWNHILL_KPH = cfg.sim_max_downhill_kph
         VMAX_DOWNHILL_MS = VMAX_DOWNHILL_KPH / 3.6
 
-        A_LAT_MAX = 1.5          # m/s², ~1.5–3.0 typical
-        TURN_MIN_DS = 5.0    # ignore tiny segments
-        TURN_MIN_DPSI_DEG = 6.0  # ignore tiny direction noise
-
         V_MIN_MS = 0.5          # avoid dt explosions at near-zero speed
-        V_SEARCH_MAX_MS = 40.0  # 144 km/h search ceiling for solving P(v)=P_TARGET
-
-        n = len(lats)
-
-        def _wrap_deg180(a):
-            return (a + 180.0) % 360.0 - 180.0
-
-        # 1) distances between points (meters)
-        ds = [0.0] * n
-        for i in range(1, n):
-            ds[i] = geodesic((lats[i-1], lons[i-1]), (lats[i], lons[i])).meters
-
-        bearings_deg = [0.0] * n
-        for i in range(1, n):
-            bearings_deg[i-1] = compute_bearing(lats[i-1], lons[i-1], lats[i], lons[i])
-        bearings_deg[-1] = bearings_deg[-2] if n > 1 else 0.0
+        V_SEARCH_MAX_MS = VMAX_DOWNHILL_MS  # 144 km/h search ceiling for solving P(v)=P_TARGET
 
 
-        # 2) solve speed per point from power model (quasi-steady: acceleration=0)
+
+        # 2) solve speed per point from power model)
         def _power_at_v(v_ms, i):
             p, *_ = compute_power(
                 v_ms,
-                (v_ms-sim_speeds_ms[-1]),  # quasi-steady
+                (v_ms-sim_speeds_ms[-1]),
                 smoothed_grades[i],
                 smoothed_headwinds[i],
                 cfg,
                 rho_series[i],
-                ride_type_series[i],
+                slope_type_series[i],
             )
             return float(p)
         
@@ -2249,16 +3014,19 @@ def _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_c
                 return min(hi, V_SEARCH_MAX_MS)
 
             # standard binary search
-            for _ in range(40):
+            for _ in range(100):
                 mid = 0.5 * (lo + hi)
                 p_mid = _power_at_v(mid, i)
                 if p_mid < P_TARGET_W:
                     lo = mid
                 else:
                     hi = mid
+                if hi - lo < 0.01:
+                    break
             return max(hi, V_MIN_MS)
 
-        sim_speeds_ms = [max(smoothed_speeds_ms[0], V_MIN_MS)]
+        
+        sim_speeds_ms = [0.0]  # first point speed = 0
         for i in range(1, n):
             v = _solve_v_for_power(i)
 
@@ -2266,28 +3034,9 @@ def _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_c
             if smoothed_grades[i] < 0.0:
                 v = min(v, VMAX_DOWNHILL_MS)
 
-            # ---- NEW: turn-based cap from bearing change ----
-            if i >= 2 and ds[i] >= TURN_MIN_DS:
-                dpsi_deg = abs(_wrap_deg180(bearings_deg[i] - bearings_deg[i-1]))
-                if dpsi_deg >= TURN_MIN_DPSI_DEG:
-                    dpsi = math.radians(dpsi_deg)
-                    # radius ~ ds/dpsi, vcap = sqrt(a_lat_max * R)
-                    v_turn_cap = math.sqrt(A_LAT_MAX * (ds[i] / max(dpsi, 1e-6)))
-                    v = min(v, v_turn_cap)
-
-            sim_speeds_ms.append(max(v, V_MIN_MS))
-
-
-        tau_s = SMOOTHING_WINDOW_SIZE_S  # 3–10 s typical
-        sim_speeds_ms_smooth = [sim_speeds_ms[0]]
-        for i in range(1, n):
-            dt0 = (times[i].timestamp() - times[i-1].timestamp())
-            dt0 = max(dt0, 1.0)  # fallback
-            alpha = dt0 / (tau_s + dt0)
-            sim_speeds_ms_smooth.append(
-                sim_speeds_ms_smooth[-1] + alpha * (sim_speeds_ms[i] - sim_speeds_ms_smooth[-1])
-            )
-        sim_speeds_ms = sim_speeds_ms_smooth
+            sim_speeds_ms.append(v)
+        
+        
         # 3) integrate new timestamps
         t0 = times[0]
         new_times = [t0]
@@ -2387,7 +3136,7 @@ def _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_c
             smoothed_headwinds[i],
             cfg,
             rho_series[i],
-            ride_type_series[i]
+            slope_type_series[i]
         )
         powers.append(p)
         powers_details["slope"].append(p_g)
@@ -2435,7 +3184,7 @@ def _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_c
     return out, core, smooth
 
 
-def _filter_and_disk_temp(core, smooth, ride_type_series, power_data, weather, progress_cb=None):
+def _filter_and_disk_temp(core, smooth, slope_type_series, corner_type_series, power_data, weather, progress_cb=None):
     """Apply validity filters, compute cumulative distance, brake temps, and filtered arrays."""
     def _report(pct, text):
         if progress_cb is not None:
@@ -2460,7 +3209,7 @@ def _filter_and_disk_temp(core, smooth, ride_type_series, power_data, weather, p
     smoothed_decel_powers = power_data["smoothed_decel_powers"]
     smoothed_headwinds = power_data["smoothed_headwinds"]
     accelerations = power_data["accelerations"]
-
+    
     temp_series = weather["temp_c"]
     rho_series = weather["rho"]
     pres_series = weather["pres_hpa"]
@@ -2468,7 +3217,7 @@ def _filter_and_disk_temp(core, smooth, ride_type_series, power_data, weather, p
     wind_series = weather["wspd_ms"]
     wind_dir_series = weather["wdir_deg"]
 
-    grades_array = np.array(moving_average(grades, window_size=SMOOTHING_WINDOW_SIZE_S))
+    grades_array = np.array(moving_average(grades, window_size=1))
 
     valid = (
         (smoothed_speeds_kph < MAX_SPEED) &
@@ -2508,9 +3257,11 @@ def _filter_and_disk_temp(core, smooth, ride_type_series, power_data, weather, p
     )
 
     idx = valid
-    total_distance_km = total_dists[idx][-1] if np.any(idx) else 0.0
-    elevation_gain_m = float(np.sum(np.clip(np.diff(smoothed_alts), 0, None))) if len(smoothed_alts) > 1 else 0.0
 
+    grades_array_filtered = lowpass_ema(grades_array[idx] * 100.0, alpha=0.2)
+    grades_array = np.array(moving_average(grades, window_size=SMOOTHING_WINDOW_SIZE_ALT_S))
+    total_distance_km = total_dists[idx][-1] if np.any(idx) else 0.0
+    elevation_gain_m = float(np.sum(np.clip(np.diff(smoothed_alts[idx]), 0, None))) if len(smoothed_alts[idx]) > 1 else 0.0
     return {
         "valid": idx,
         "total_dists": total_dists,
@@ -2537,7 +3288,7 @@ def _filter_and_disk_temp(core, smooth, ride_type_series, power_data, weather, p
         "filtered_decel_powers": smoothed_decel_powers[idx],
         "filtered_temp_front_disk_c": np.array(temp_front_disk_c)[idx],
         "filtered_temp_rear_disk_c": np.array(temp_rear_disk_c)[idx],
-        "filtered_grades": grades_array[idx] * 100.0,
+        "filtered_grades": grades_array_filtered,
         "filtered_rho": np.array(rho_series)[idx],
         "filtered_temp": np.array(temp_series)[idx],
         "filtered_pres": np.array(pres_series)[idx],
@@ -2546,27 +3297,33 @@ def _filter_and_disk_temp(core, smooth, ride_type_series, power_data, weather, p
         "filtered_global_winds": np.array(wind_series)[idx],
         "total_distance_km": total_distance_km,
         "elevation_gain_m": elevation_gain_m,
-        "filtered_ride_type": ride_type_series[idx]
+        "filtered_slope_type": slope_type_series[idx],
+        "filtered_corner_type": corner_type_series[idx],
+        "filtered_bearings_degs": core["bearings_degs"][idx]
     }
 
 
 def _filter_device_sensors(core, valid_mask):
     """Filter interpolated device sensor series with same mask."""
+    return_dict = {}
     if "hr_series" in core:
-        return {
-            "filtered_hr_bpm": core["hr_series"][valid_mask],
-            "filtered_cad_meas_rpm": core["cad_series"][valid_mask],
-            "filtered_power_meas_w": core["pow_series"][valid_mask],
-            "filtered_temp_device_c": core["temp_dev_series"][valid_mask],
-        }
+        return_dict["filtered_hr_bpm"] = core["hr_series"][valid_mask]
     else:
-        return {
-            "filtered_hr_bpm": np.array([]),
-            "filtered_cad_meas_rpm": np.array([]),
-            "filtered_power_meas_w": np.array([]),
-            "filtered_temp_device_c": np.array([]),
-        }
-
+        return_dict["filtered_hr_bpm"] = None
+    if "cad_series" in core:
+        return_dict["filtered_cad_meas_rpm"] = core["cad_series"][valid_mask]
+    else:
+        return_dict["filtered_cad_meas_rpm"] = None
+    if "pow_series" in core:
+        return_dict["filtered_power_meas_w"] = core["pow_series"][valid_mask]
+    else:
+        return_dict["filtered_power_meas_w"] = None
+    if "temp_dev_series" in core:
+        return_dict["filtered_temp_device_c"] = core["temp_dev_series"][valid_mask]
+    else:
+        return_dict["filtered_temp_device_c"] = None
+    
+    return return_dict
 
 def _compute_kcal_timeseries(filtered_times, filtered_powers, timestep_min, cfg):
     """Compute cumulative kcal from active power and base metabolism."""
@@ -2683,7 +3440,6 @@ def _detect_breaks(smoothed_speeds_kph, times, total_dists, timestep_min, break_
         })
 
     return breaks
-
 
 
 def _augment_break_positions(breaks, lats, lons):
@@ -2904,15 +3660,251 @@ def _detect_climbs_and_downhills(smoothed_alts, deltadists, times, dists):
     downhills = downhills[::-1]
     combined_downhills = _combine_adjacent_segments(downhills, MAX_DIST_BETWEEN_CLIMBS_M)
 
-    ride_type_series = _create_ride_type_timeseries(len(smoothed_alts), combined_climbs, combined_downhills)
-    return climbs, combined_climbs, downhills, combined_downhills, ride_type_series
+    slope_type_series = _create_slope_type_timeseries(len(smoothed_alts), combined_climbs, combined_downhills)
+    return climbs, combined_climbs, downhills, combined_downhills, slope_type_series
 
 
-def _create_ride_type_timeseries(n_samples, combined_climbs, combined_downhills):
+
+def _wrap_rad_pi(x):
+    return (x + math.pi) % (2 * math.pi) - math.pi
+
+
+def _compute_kappa_pointwise(bearings_deg, ds_m, kappa_cap=1.0):
+    """
+    Pointwise curvature proxy: kappa[i] ~ |dpsi|/ds  [rad/m]
+    kappa_cap limits spikes from tiny ds.
+    """
+    psi = np.radians(np.asarray(bearings_deg, dtype=float))
+    ds = np.asarray(ds_m, dtype=float)
+    n = len(psi)
+
+    kappa = np.zeros(n, dtype=float)
+    for i in range(1, n):
+        d = ds[i]
+        if d <= 1e-3:
+            kappa[i] = 0.0
+            continue
+        dpsi = _wrap_rad_pi(psi[i] - psi[i - 1])
+        k = abs(dpsi) / d
+        kappa[i] = min(k, kappa_cap)
+    return kappa
+
+
+def _smooth_over_distance(x, ds_m, win_m=15.0):
+    """
+    Distance-window moving average. Robust even if dt is irregular.
+    """
+    x = np.asarray(x, dtype=float)
+    ds = np.asarray(ds_m, dtype=float)
+    n = len(x)
+    s = np.cumsum(ds)
+
+    y = np.zeros(n, dtype=float)
+    j0 = 0
+    j1 = 0
+    for i in range(n):
+        left = s[i] - 0.5 * win_m
+        right = s[i] + 0.5 * win_m
+        while j0 < n and s[j0] < left:
+            j0 += 1
+        while j1 < n and s[j1] < right:
+            j1 += 1
+        a = max(0, min(n - 1, j0))
+        b = max(0, min(n, j1))  # b is exclusive
+
+        if b <= a + 1:
+            y[i] = x[i]
+        else:
+            y[i] = float(np.mean(x[a:b]))
+    return y
+
+
+def detect_corners(
+    bearings_deg,
+    ds_m,
+    lats,
+    lons,
+    win_m=15.0,
+    kappa_on=0.010,      # rad/m  (start threshold)
+    kappa_off=0.006,     # rad/m  (end threshold)
+    min_len_m=12.0,
+    min_turn_deg=12.0,
+    merge_gap_m=8.0
+):
+    """
+    Returns list of corners with start/end indices and metrics.
+    Tune kappa_on/off based on your sampling + GPS noise.
+    """
+
+    n = len(bearings_deg)
+    ds = np.asarray(ds_m, dtype=float)
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
+
+    # 1) curvature proxy + distance smoothing
+    kappa = _compute_kappa_pointwise(bearings_deg, ds, kappa_cap=0.5)
+    kappa_s = _smooth_over_distance(kappa, ds, win_m=win_m)
+
+    # 2) detect segments with hysteresis
+    corners = []
+    in_corner = False
+    i0 = 0
+
+    s = np.cumsum(ds)
+
+    def _finalize(a, b):
+        # metrics
+        seg_ds = ds[a:b+1]
+        seg_k = kappa_s[a:b+1]
+
+        length_m = float(np.sum(seg_ds))
+        # turn angle ~ integral(kappa ds) in radians
+        turn_rad = float(np.sum(seg_k * seg_ds))
+        turn_deg = turn_rad * 180.0 / math.pi
+
+        if length_m < min_len_m:
+            return
+        if turn_deg < min_turn_deg:
+            return
+
+        imax = int(a + np.argmax(seg_k))
+        lat_c = float(np.mean(lats[a:b+1]))
+        lon_c = float(np.mean(lons[a:b+1]))
+
+        corners.append({
+            "start_idx": int(a),
+            "end_idx": int(b),
+            "center_idx": int(imax),
+            "length_m": length_m,
+            "turn_angle_deg": turn_deg,
+            "kappa_max": float(np.max(seg_k)) if seg_k.size else 0.0,
+            "kappa_mean": float(np.mean(seg_k)) if seg_k.size else 0.0,
+            "lat": lat_c,
+            "lon": lon_c,
+            "start_distance_m": float(s[a]) if a < len(s) else 0.0,
+            "end_distance_m": float(s[b]) if b < len(s) else 0.0,
+        })
+
+    for i in range(n):
+        if not in_corner:
+            if kappa_s[i] >= kappa_on:
+                in_corner = True
+                i0 = i
+        else:
+            if kappa_s[i] <= kappa_off:
+                in_corner = False
+                _finalize(i0, i)
+
+    if in_corner:
+        _finalize(i0, n - 1)
+
+    # 3) merge corners that are very close (like your climb fusion)
+    if not corners:
+        return corners
+
+    merged = []
+    cur = corners[0]
+    for nxt in corners[1:]:
+        gap = nxt["start_distance_m"] - cur["end_distance_m"]
+        if gap <= merge_gap_m:
+            # merge by extending end; recompute cheap combined metrics later if you want
+            cur["end_idx"] = nxt["end_idx"]
+            cur["end_distance_m"] = nxt["end_distance_m"]
+            # merge lat/lon by averaging centers weighted by length
+            w1 = max(cur.get("length_m", 1.0), 1e-6)
+            w2 = max(nxt.get("length_m", 1.0), 1e-6)
+            cur["lat"] = (cur["lat"] * w1 + nxt["lat"] * w2) / (w1 + w2)
+            cur["lon"] = (cur["lon"] * w1 + nxt["lon"] * w2) / (w1 + w2)
+            # conservative: keep max curvature
+            cur["kappa_max"] = max(cur.get("kappa_max", 0.0), nxt.get("kappa_max", 0.0))
+            # keep approximate sums for display
+            cur["length_m"] = cur.get("length_m", 0.0) + nxt.get("length_m", 0.0)
+            cur["turn_angle_deg"] = cur.get("turn_angle_deg", 0.0) + nxt.get("turn_angle_deg", 0.0)
+        else:
+            merged.append(cur)
+            cur = nxt
+    merged.append(cur)
+
+    corner_type_series = _create_corner_type_timeseries(n, merged)
+    return merged, corner_type_series
+
+def _create_corner_type_timeseries(n_samples, merged_corners):
+    """
+    Create a categorical cornering series of length n_samples.
+
+    Output: corner_type (np.ndarray of dtype=object)
+        Each entry is one of:
+            "straight"
+            "corner_gentle"
+            "corner_medium"
+            "corner_tight"
+
+    Priority (if overlaps happen):
+        tight overrides medium overrides gentle
+    """
+    corner_type = np.full(n_samples, "straight", dtype=object)
+
+    if not merged_corners:
+        return corner_type
+
+    # --- classify corners (optional but useful) ---
+    # If you store kappa_max in each corner dict, it is the most physical knob.
+    # Otherwise fall back to total turn angle.
+    def _classify(c):
+        k = c.get("kappa_max", None)
+        if k is not None and np.isfinite(k):
+            k = float(k)
+            # tune these thresholds if needed; typical: kappa ~ 1/R (1/m)
+            # R=50m -> 0.02; R=100m -> 0.01; R=200m -> 0.005
+            if k >= 0.020:
+                return "corner_tight"
+            elif k >= 0.010:
+                return "corner_medium"
+            else:
+                return "corner_gentle"
+
+        # fallback: angle in degrees (if you store it)
+        ang = c.get("turn_deg", c.get("turn_total_deg", None))
+        if ang is not None and np.isfinite(ang):
+            ang = float(ang)
+            if ang >= 75:
+                return "corner_tight"
+            elif ang >= 35:
+                return "corner_medium"
+            else:
+                return "corner_gentle"
+
+        # if nothing is available, treat as gentle
+        return "corner_gentle"
+
+    # overlap priority
+    prio = {"straight": 0, "corner_gentle": 1, "corner_medium": 2, "corner_tight": 3}
+
+    for seg in merged_corners:
+        i0 = int(seg.get("start_idx", 0))
+        i1 = int(seg.get("end_idx", i0))
+
+        i0 = max(i0, 0)
+        i1 = min(i1, n_samples - 1)
+        if i1 < i0:
+            continue
+
+        label = _classify(seg)
+
+        # apply with priority (so tight wins if overlap happens)
+        current = corner_type[i0:i1 + 1]
+        # where new label has higher priority than existing, overwrite
+        mask = np.fromiter((prio[label] > prio[x] for x in current), dtype=bool, count=current.size)
+        current[mask] = label
+        corner_type[i0:i1 + 1] = current
+
+    return corner_type
+
+def _create_slope_type_timeseries(n_samples, combined_climbs, combined_downhills):
     """
     Create a categorical ride-type series of length n_samples.
 
-    Output: ride_type (np.ndarray of dtype=object)
+    Output: slope_type (np.ndarray of dtype=object)
         Each entry is one of:
             "level"
             "climb"
@@ -2923,7 +3915,7 @@ def _create_ride_type_timeseries(n_samples, combined_climbs, combined_downhills)
     """
 
     # start with everything marked as "level"
-    ride_type = np.full(n_samples, "level", dtype=object)
+    slope_type = np.full(n_samples, "level", dtype=object)
 
     # mark climbs
     for seg in combined_climbs:
@@ -2933,7 +3925,7 @@ def _create_ride_type_timeseries(n_samples, combined_climbs, combined_downhills)
         i0 = max(i0, 0)
         i1 = min(i1, n_samples - 1)
         if i1 >= i0:
-            ride_type[i0:i1 + 1] = "climb"
+            slope_type[i0:i1 + 1] = "climb"
 
     # mark downhills (override where present)
     for seg in combined_downhills:
@@ -2942,9 +3934,9 @@ def _create_ride_type_timeseries(n_samples, combined_climbs, combined_downhills)
         i0 = max(i0, 0)
         i1 = min(i1, n_samples - 1)
         if i1 >= i0:
-            ride_type[i0:i1 + 1] = "downhill"
+            slope_type[i0:i1 + 1] = "downhill"
 
-    return ride_type
+    return slope_type
 
 
 def _augment_climb_metrics(climb_list, filtered_dists, filtered_powers, timestep_min):
@@ -2986,26 +3978,29 @@ def _augment_climb_metrics(climb_list, filtered_dists, filtered_powers, timestep
         c["vam_m_per_h"] = vam
 
 
-def _build_5km_segments(filtered, timestep_min):
+def _build_5km_segments(kwargs, seg_size_km=5.0):
     """Build 5 km segments from filtered arrays and compute metrics."""
-    filtered_dists = filtered["filtered_dists"]
-    filtered_speeds_kph = filtered["filtered_speeds_kph"]
-    filtered_powers = filtered["filtered_powers"]
-    filtered_pwr_details = filtered["filtered_pwr_details"]
-    filtered_grades = filtered["filtered_grades"]
-    filtered_smoothed_alts = filtered["filtered_smoothed_alts"]
+    timestep_min = kwargs.get("timestep_min", 1.0)
+    filtered_dists = kwargs.get("filtered_dists", [])
+    filtered_speeds_kph = kwargs.get("filtered_speeds_kph", [])
+    filtered_powers = kwargs.get("filtered_powers", [])
+    filtered_pwr_details = kwargs.get("filtered_pwr_details", {})
+    filtered_grades = kwargs.get("filtered_grades", [])
+    filtered_smoothed_alts = kwargs.get("filtered_smoothed_alts", np.zeros_like(filtered_dists))
+    filtered_power_meas_w = kwargs.get("filtered_power_meas_w", np.zeros_like(filtered_dists))
 
     segments_5km = []
     if len(filtered_dists) <= 1:
         return segments_5km
 
-    seg_length_km = 5.0
+    seg_length_km = seg_size_km
     total_dist_km_seg = filtered_dists[-1]
     seg_start_km = 0.0
     seg_index = 1
     fd = np.array(filtered_dists, dtype=float)
     fs = np.array(filtered_speeds_kph, dtype=float)
     fp = np.array(filtered_powers, dtype=float)
+    fp_meas = np.array(filtered_power_meas_w, dtype=float)
     fp_g = np.array(filtered_pwr_details["slope"], dtype=float)
     fp_r = np.array(filtered_pwr_details["roll"], dtype=float)
     fp_d = np.array(filtered_pwr_details["drag"], dtype=float)
@@ -3029,6 +4024,7 @@ def _build_5km_segments(filtered, timestep_min):
         dist_km = seg_end_km - seg_start_km
         duration_min = idxs.size * timestep_min
         sp_seg = fs[idxs]
+        pw_meas_seg = fp_meas[idxs]
         pw_seg = fp[idxs]
         pwg_seg = fp_g[idxs]
         pwr_seg = fp_r[idxs]
@@ -3046,6 +4042,7 @@ def _build_5km_segments(filtered, timestep_min):
         avg_spd = float(np.mean(sp_seg)) if sp_seg.size > 0 else 0.0
 
         if np.any(pw_seg > 0):
+            avg_pwr_meas = float(np.mean(np.clip(pw_meas_seg, 0, None)))
             avg_pwr = float(np.mean(np.clip(pw_seg, 0, None)))
             avg_pwr_g = float(np.mean(pwg_seg[:]))
             avg_pwr_r = float(np.mean(pwr_seg[:]))
@@ -3055,6 +4052,7 @@ def _build_5km_segments(filtered, timestep_min):
             avg_pwr_b = float(np.mean(-1.*np.clip(pw_seg[:], None, 0.0)))
             avg_pwr_pt = float(np.mean(pwpt_seg[:]))
         else:
+            avg_pwr_meas = float(np.mean(pw_meas_seg)) if pw_meas_seg.size > 0 else 0.0
             avg_pwr = float(np.mean(pw_seg)) if pw_seg.size > 0 else 0.0
             avg_pwr_g = float(np.mean(pwg_seg)) if pwg_seg.size > 0 else 0.0
             avg_pwr_r = float(np.mean(pwr_seg)) if pwr_seg.size > 0 else 0.0
@@ -3073,6 +4071,7 @@ def _build_5km_segments(filtered, timestep_min):
             "distance_km": dist_km,
             "duration_min": duration_min,
             "avg_speed_kph": avg_spd,
+            "avg_pwr_meas": avg_pwr_meas,
             "avg_power_w": avg_pwr,
             "avg_pwr_g_w": avg_pwr_g,
             "avg_pwr_r_w": avg_pwr_r,
@@ -3087,17 +4086,23 @@ def _build_5km_segments(filtered, timestep_min):
 
         seg_start_km = seg_end_km
         seg_index += 1
-
+        
     return segments_5km
 
 
-def _gear_simulation(filtered, cfg, target_cadence, exclude_downhill_gears):
+def _gear_simulation(filtered, filtered_sensors, cfg, target_cadence, exclude_downhill_gears):
     """Simulate gear selection, shifts, and cadence stats."""
     filtered_speeds_kph = filtered["filtered_speeds_kph"]
     filtered_powers = filtered["filtered_powers"]
     filtered_dists = filtered["filtered_dists"]
-
     gear_list, gear_by_combo = build_gear_list(cfg)
+
+    if not target_cadence:
+        target_cadence = filtered_sensors["filtered_cad_meas_rpm"]
+    else:
+        #make array from single target cadence value
+        target_cadence = np.full(len(filtered_speeds_kph), target_cadence, dtype=float)
+
 
     current_front = cfg.front_der_teeth[-1]
     current_rear_idx = 0
@@ -3115,7 +4120,7 @@ def _gear_simulation(filtered, cfg, target_cadence, exclude_downhill_gears):
 
         current_gear = gear_list[current_gear_idx]
         current_cadence = wheel_rpm * (current_gear['rear'] / current_gear['front'])
-        cadence_error = current_cadence - target_cadence
+        cadence_error = current_cadence - target_cadence[i_filtered]
 
         time_since_rear_shift = i_filtered - last_shift_time_rear
 
@@ -3126,7 +4131,7 @@ def _gear_simulation(filtered, cfg, target_cadence, exclude_downhill_gears):
 
         if should_shift_rear:
             best_rear = find_best_rear_gear(
-                current_front, wheel_rpm, target_cadence,
+                current_front, wheel_rpm, target_cadence[i_filtered],
                 cfg.rear_der_teeth, gear_by_combo
             )
             if best_rear and best_rear != current_rear:
@@ -3142,7 +4147,7 @@ def _gear_simulation(filtered, cfg, target_cadence, exclude_downhill_gears):
         if new_front != current_front:
             current_front = new_front
             best_rear = find_best_rear_gear(
-                current_front, wheel_rpm, target_cadence,
+                current_front, wheel_rpm, target_cadence[i_filtered],
                 cfg.rear_der_teeth, gear_by_combo
             )
             if best_rear and (current_front, best_rear) in gear_by_combo:
@@ -3224,23 +4229,37 @@ def _gear_simulation(filtered, cfg, target_cadence, exclude_downhill_gears):
 def analyze_gpx_file(
     gpx_path: str,
     cfg: RiderBikeConfig,
-    target_cadence: int = DEFAULT_TARGET_CADENCE,
-    use_wind_data: bool = True,
     exclude_downhill_gears: bool = True,
-    break_threshold_min: float = 10.0,
     progress_cb=None,
-    simulate=False
 ):
     """
     Main analysis: orchestrates all steps and returns a big result dict.
     """
+    use_ambient_data = cfg.globals.get("USE_AMBIENT_DATA", True)
+    use_wind_data = cfg.globals.get("USE_WIND_DATA", False)
+    break_threshold_min = cfg.globals.get("BREAK_THRESHOLD_MIN", 10.0)
+    simulate = cfg.globals.get("SIMULATE", False)
+
+    global SMOOTHING_WINDOW_SIZE_S, SMOOTHING_WINDOW_SIZE_ALT_S, SMOOTHING_WINDOW_SIZE_ALT_S_GPX_TCX, SMOOTHING_WINDOW_SIZE_ALT_S_FIT, SMOOTHING_WINDOW_SIZE_S_FIT, SMOOTHING_WINDOW_SIZE_ALT_S_GPX_TCX
+    #select smoothing value based of file extension
+    if gpx_path.lower().endswith(".fit"):
+        SMOOTHING_WINDOW_SIZE_S = SMOOTHING_WINDOW_SIZE_S_FIT
+        SMOOTHING_WINDOW_SIZE_ALT_S = SMOOTHING_WINDOW_SIZE_ALT_S_FIT
+    if gpx_path.lower().endswith(".gpx") or gpx_path.lower().endswith(".tcx"):
+        SMOOTHING_WINDOW_SIZE_S = SMOOTHING_WINDOW_SIZE_S_GPX_TCX
+        SMOOTHING_WINDOW_SIZE_ALT_S = SMOOTHING_WINDOW_SIZE_ALT_S_GPX_TCX
 
     def _report(pct, text):
         if progress_cb is not None:
             progress_cb(int(pct), text)
 
     # 1) Parse + interpolate core time series
-    core = _parse_and_interpolate_gpx(gpx_path, progress_cb=_report)
+    if gpx_path.lower().endswith(".gpx"):
+        core = _parse_and_interpolate_gpx(gpx_path, progress_cb=_report)
+    elif gpx_path.lower().endswith(".tcx"):
+        core = _parse_and_interpolate_tcx(gpx_path, progress_cb=_report)
+    elif gpx_path.lower().endswith(".fit"):
+        core = _parse_and_interpolate_fit(gpx_path, progress_cb=_report)
     local_start_time = core["times_local_display"][0]
     local_end_time = core["times_local_display"][-1]
     start_time = core["start_time"]
@@ -3251,22 +4270,40 @@ def analyze_gpx_file(
     smooth = _smooth_and_grades(core)
 
     # 3) Weather / air density
-    weather = _weather_and_air_density(core, use_wind_data, progress_cb=_report)
+    weather = _weather_and_air_density(core, use_ambient_data, use_wind_data, progress_cb=_report)
 
     # 9) Climbs & downhills
     _report(40, "Find climbs...")
     
-    climbs, combined_climbs, downhills, combined_downhills, ride_type_series = _detect_climbs_and_downhills(smooth["smoothed_alts"], smooth["dists"], smooth["times"], smooth["total_dists"])
+    climbs, combined_climbs, downhills, combined_downhills, slope_type_series = _detect_climbs_and_downhills(smooth["smoothed_alts"], smooth["dists"], smooth["times"], smooth["total_dists"])
+
+    # 9b) Corners (after climbs, before power)
+    _report(45, "Find corners...")
+    corners, corner_type_series = detect_corners(
+        bearings_deg=core["bearings_degs"],
+        ds_m=np.asarray(core["dists"], dtype=float) * 1000.0,   # smooth["dists"] is km in your codebase
+        lats=np.asarray(core["lats"], dtype=float),
+        lons=np.asarray(core["lons"], dtype=float),
+        win_m=10.0,
+        kappa_on=0.01,      # tune if needed
+        kappa_off=0.01,
+        min_len_m=5.0,
+        min_turn_deg=20.0,
+        merge_gap_m=2.0
+    )
+
+    core["corners"] = corners
 
     # 4) Headwind & power components
-    power_data, core, smooth= _headwind_and_power(core, smooth, ride_type_series, weather, cfg, progress_cb=_report,simulate=simulate)
+    power_data, core, smooth= _headwind_and_power(core, smooth, slope_type_series, weather, cfg, progress_cb=_report,simulate=simulate)
 
     local_start_time = core["times_local_display"][0]
     local_end_time = core["times_local_display"][-1]
     start_time = core["start_time"]
     end_time = core["end_time"]
+
     # 5) Filter & brake temps
-    filtered = _filter_and_disk_temp(core, smooth, ride_type_series, power_data, weather, progress_cb=_report)
+    filtered = _filter_and_disk_temp(core, smooth, slope_type_series, corner_type_series, power_data, weather, progress_cb=_report)
 
     # 6) Device-based sensors filtered
     filtered_sensors = _filter_device_sensors(core, filtered["valid"])
@@ -3366,7 +4403,7 @@ def analyze_gpx_file(
 
     # 10) Segments 5 km
     _report(87, "Build 5 km segments...")
-    segments_5km = _build_5km_segments(filtered, timestep_min)
+    segments_5km = _build_5km_segments({**filtered,**filtered_sensors})
     best_seg_power_5km = 0.0
     if segments_5km:
         vals_seg = [s["avg_power_w"] for s in segments_5km if not math.isnan(s.get("avg_power_w", 0.0))]
@@ -3375,7 +4412,12 @@ def analyze_gpx_file(
 
     # 11) Gear simulation
     _report(90, "Simulating gear shifts...")
-    gear_sim = _gear_simulation(filtered, cfg, target_cadence, exclude_downhill_gears)
+    
+    if cfg.globals.get("USE_MEAS_CADENCE", False) and not (np.all(np.isnan(filtered_sensors.get("filtered_cad_meas_rpm", None)))):
+        target_cadence = None
+    else:
+        target_cadence = cfg.globals.get("TARGET_CADENCE", DEFAULT_TARGET_CADENCE)
+    gear_sim = _gear_simulation(filtered, filtered_sensors, cfg, target_cadence, exclude_downhill_gears)
 
     # 12) Summary stats & console printouts
     powers_arr = np.asarray(filtered["filtered_powers"], dtype=float)
@@ -3526,29 +4568,7 @@ def analyze_gpx_file(
         "local_end_time": local_end_time,
         "gpx_path": gpx_path,
         "timestep_min": timestep_min,
-        "filtered_times": filtered["filtered_times"],
-        "filtered_dists": filtered["filtered_dists"],
-        "filtered_lats": filtered["filtered_lats"],
-        "filtered_lons": filtered["filtered_lons"],
-        "filtered_raw_alts": filtered["filtered_raw_alts"],
-        "filtered_smoothed_alts": filtered["filtered_smoothed_alts"],
-        "filtered_raw_speeds": filtered["filtered_raw_speeds"],
-        "filtered_speeds_kph": filtered["filtered_speeds_kph"],
-        "filtered_powers": filtered["filtered_powers"],
-        "filtered_pwr_details": filtered["filtered_pwr_details"],
-        "filtered_brake_powers": filtered["filtered_brake_powers"],
-        "filtered_decel_powers": filtered["filtered_decel_powers"],
-        "filtered_temp_front_disk_c": filtered["filtered_temp_front_disk_c"],
-        "filtered_temp_rear_disk_c": filtered["filtered_temp_rear_disk_c"],
-        "filtered_grades": filtered["filtered_grades"],
-        "filtered_head_winds": filtered["filtered_head_winds"],
-        "filtered_global_winds": filtered["filtered_global_winds"],
-        "filtered_wind_dirs": filtered["filtered_wind_dirs"],
-        "filtered_rho": filtered["filtered_rho"],
-        "filtered_temp": filtered["filtered_temp"],
-        "filtered_pres": filtered["filtered_pres"],
-        "filtered_rhum": filtered["filtered_rhum"],
-        "filtered_ride_type": filtered["filtered_ride_type"],
+        **filtered,
         # "wind_series_full": weather["wspd_ms"],
         # "wind_dir_series_full": weather["wdir_deg"],
         # "rho_series_full": weather["rho"],
@@ -3556,6 +4576,7 @@ def analyze_gpx_file(
         # "pres_series_full": weather["pres_hpa"],
         # "rhum_series_full": weather["rhum_pct"],
         # device channels
+        "corners": core["corners"],
         **filtered_sensors,
         # gears
         "selected_front_teeth": gear_sim["selected_front_teeth"],
@@ -3605,6 +4626,7 @@ def analyze_gpx_file(
         "elevation_gain_m": filtered["elevation_gain_m"],
         "cfg": cfg,
         "target_cadence": target_cadence,
+        "use_ambient_data": use_ambient_data,
         "use_wind_data": use_wind_data,
         # kcal timeseries
         "cum_kcal_active": kcal_data["cum_kcal_active"],
@@ -3744,7 +4766,7 @@ def fun_energy_tooltip(kcal):
     ]
     end = random.choice(closers)
 
-    return "Burned energy equivalents:\n" + "\n".join(lines) + "\n\n" + end
+    return "Burned energy equivalents:\n\n" + "\n\n".join(lines) + "\n\n" + end
 
 # =============================================================================
 # Small “log” helper (Streamlit-friendly)
@@ -3779,11 +4801,13 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
     global COMBINE_BREAK_MAX_TIME_DIFF, COMBINE_BREAK_MAX_DISTANCE
     global G
     global CLIMB_MIN_DISTANCE_KM, CLIMB_MIN_ELEVATION_GAIN_M, CLIMB_END_AVERAGE_GRADE_PCT, CLIMB_END_WINDOW_SIZE_M, MAX_DIST_BETWEEN_CLIMBS_M
-    global SMOOTHING_WINDOW_SIZE_S
+    global SMOOTHING_WINDOW_SIZE_S, SMOOTHING_WINDOW_SIZE_ALT_S, SMOOTHING_WINDOW_SIZE_ALT_S_GPX_TCX, SMOOTHING_WINDOW_SIZE_ALT_S_FIT, SMOOTHING_WINDOW_SIZE_S_FIT, SMOOTHING_WINDOW_SIZE_S_GPX_TCX
     global REFERENCE_CDA_VALUE
     global AMBIENT_TEMP_C, AMBIENT_RHO, AMBIENT_PRES_HPA, AMBIENT_RHUM_PCT, AMBIENT_WIND_DIR_DEG, AMBIENT_WIND_SPEED_MS
     global OVERRIDE_RIDE_START_DATETIME
     global USE_DATETIME_OVERRIDE
+    global DROPS_DRAG_REDUCTION
+    
 
     # --- analysis / simulation globals ---
     EFFICIENCY = float(state["EFFICIENCY"])
@@ -3809,7 +4833,11 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
     CLIMB_END_WINDOW_SIZE_M = int(state["CLIMB_END_WINDOW_SIZE_M"])
     MAX_DIST_BETWEEN_CLIMBS_M = int(state["MAX_DIST_BETWEEN_CLIMBS_M"])
 
-    SMOOTHING_WINDOW_SIZE_S = int(state["SMOOTHING_WINDOW_SIZE_S"])
+    SMOOTHING_WINDOW_SIZE_S_GPX_TCX = int(state["SMOOTHING_WINDOW_SIZE_S_GPX_TCX"])
+    SMOOTHING_WINDOW_SIZE_ALT_S_GPX_TCX = int(state["SMOOTHING_WINDOW_SIZE_ALT_S_GPX_TCX"])
+    SMOOTHING_WINDOW_SIZE_S_FIT = int(state["SMOOTHING_WINDOW_SIZE_S_FIT"])
+    SMOOTHING_WINDOW_SIZE_ALT_S_FIT = int(state["SMOOTHING_WINDOW_SIZE_ALT_S_FIT"])
+    SMOOTHING_WINDOW_SIZE_S = SMOOTHING_WINDOW_SIZE_S_GPX_TCX  # default for gpx/tcx; fit uses its own
 
     # --- brake globals ---
     BRAKE_FRONT_DIAMETER_MM = float(state["BRAKE_FRONT_DIAMETER_MM"])
@@ -3820,6 +4848,8 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
 
     # --- aero / env globals ---
     REFERENCE_CDA_VALUE = float(state["REFERENCE_CDA_VALUE"])
+    DROPS_DRAG_REDUCTION = float(state["DROPS_DRAG_REDUCTION"])
+
 
     AMBIENT_TEMP_C = float(state["AMBIENT_TEMP_C"])
     AMBIENT_RHO = float(state["AMBIENT_RHO"])
@@ -3886,7 +4916,10 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
         "MAX_DIST_BETWEEN_CLIMBS_M": MAX_DIST_BETWEEN_CLIMBS_M,
 
         # smoothing
-        "SMOOTHING_WINDOW_SIZE_S": SMOOTHING_WINDOW_SIZE_S,
+        "SMOOTHING_WINDOW_SIZE_S_GPX_TCX": SMOOTHING_WINDOW_SIZE_S_GPX_TCX,
+        "SMOOTHING_WINDOW_SIZE_ALT_S_GPX_TCX": SMOOTHING_WINDOW_SIZE_ALT_S_GPX_TCX,
+        "SMOOTHING_WINDOW_SIZE_S_FIT": SMOOTHING_WINDOW_SIZE_S_FIT,
+        "SMOOTHING_WINDOW_SIZE_ALT_S_FIT": SMOOTHING_WINDOW_SIZE_ALT_S_FIT,
 
         # brakes
         "BRAKE_FRONT_DIAMETER_MM": BRAKE_FRONT_DIAMETER_MM,
@@ -3903,10 +4936,19 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
         "AMBIENT_RHUM_PCT": AMBIENT_RHUM_PCT,
         "AMBIENT_WIND_DIR_DEG": AMBIENT_WIND_DIR_DEG,
         "AMBIENT_WIND_SPEED_MS": AMBIENT_WIND_SPEED_MS,
+        "DROPS_DRAG_REDUCTION": DROPS_DRAG_REDUCTION,
 
         # time override
         "USE_DATETIME_OVERRIDE": USE_DATETIME_OVERRIDE,
         "OVERRIDE_RIDE_START_DATETIME": OVERRIDE_RIDE_START_DATETIME,
+
+        # misc
+        "TARGET_CADENCE": int(st.session_state["target_cadence"]),
+        "USE_MEAS_CADENCE": bool(st.session_state["use_meas_cad"]),
+        "USE_WIND_DATA": bool(st.session_state["use_wind"]),
+        "USE_AMBIENT_DATA": bool(st.session_state["use_ambient"]),
+        "BREAK_THRESHOLD_MIN": float(st.session_state["long_break_threshold_min"]),
+        "SIMULATE": bool(st.session_state["USE_DRIVER_SIMULATOR"]),
     }
 
     return RiderBikeConfig(
@@ -3921,6 +4963,7 @@ def build_config_from_ui(state) -> "RiderBikeConfig":
         front_der_teeth=front_teeth,
         rear_der_teeth=rear_teeth,
         draft_effect=float(state["draft_effect"]),
+        high_speed_aero_threshold_kmh=float(state["high_speed_aero_threshold_kmh"]),
         draft_effect_dh=float(state["draft_effect_dh"]),
         draft_effect_uh=float(state["draft_effect_uh"]),
         rim_weight_g= float(state["RIM_WEIGHT"]),
@@ -3982,19 +5025,19 @@ def segment_mean_by_distance(dists_km, values, spacing_km):
             out[mask] = np.nanmean(v[mask])
     return out
 
-def _add_ride_type_shading(fig, d_km, ride_type, climb_color="red", downhill_color="green", opacity=0.12):
+def _add_slope_type_shading(fig, d_km, slope_type, climb_color="red", downhill_color="green", opacity=0.12):
     """Adds vrect shading for climb/downhill segments (like your Qt axvspan)."""
-    if ride_type is None:
+    if slope_type is None:
         return
-    ride_type = np.asarray(ride_type, dtype=object)
-    if len(ride_type) != len(d_km) or len(d_km) < 2:
+    slope_type = np.asarray(slope_type, dtype=object)
+    if len(slope_type) != len(d_km) or len(d_km) < 2:
         return
 
     def add_segments(target, color):
         in_seg = False
         s = 0
-        for i in range(len(ride_type)):
-            is_t = (ride_type[i] == target)
+        for i in range(len(slope_type)):
+            is_t = (slope_type[i] == target)
             if is_t and not in_seg:
                 in_seg = True
                 s = i
@@ -4019,9 +5062,24 @@ def plot_profiles(result, highlight_climbs=False):
     pwr = _arr(result.get("filtered_powers"))
     wind= _arr(result.get("filtered_head_winds"))
     rho = _arr(result.get("filtered_rho"))
-    ride_type = result.get("filtered_ride_type", None)
 
-    d, alt, grd, spd, pwr, wind, rho = _clip_same_len(d, alt, grd, spd, pwr, wind, rho)
+    lp_pwr = lowpass_ema(pwr, alpha=0.4)
+
+    # '''
+    # sensor data:
+    
+    #         "filtered_hr_bpm"
+    #         "filtered_cad_meas_rpm"
+    #         "filtered_power_meas_w"
+    #         "filtered_temp_device_c"
+    # '''
+    cad_sens = _arr(result.get("filtered_cad_meas_rpm", np.zeros_like(d)))
+    pwr_sens = _arr(result.get("filtered_power_meas_w", np.zeros_like(d)))
+    temp_sens= _arr(result.get("filtered_temp_device_c", np.zeros_like(d)))
+
+    slope_type = result.get("filtered_slope_type", None)
+
+    d, alt, grd, spd, pwr, lp_pwr, wind, rho, cad_sens, pwr_sens, temp_sens = _clip_same_len(d, alt, grd, spd, pwr, lp_pwr, wind, rho, cad_sens, pwr_sens, temp_sens)
     if d is None or len(d) == 0:
         return go.Figure().add_annotation(text="No data", x=0.5, y=0.5, showarrow=False)
 
@@ -4038,6 +5096,9 @@ def plot_profiles(result, highlight_climbs=False):
 
     fig.add_trace(go.Scatter(x=d, y=spd, name="Speed [km/h]"), row=2, col=1)
     fig.add_trace(go.Scatter(x=d, y=pwr, name="Power [W]"), row=3, col=1)
+    fig.add_trace(go.Scatter(x=d, y=lp_pwr, name="Power (lowpass) [W]"), row=3, col=1)
+    # add sensor power as dashed line
+    fig.add_trace(go.Scatter(x=d, y=pwr_sens, name="Power (measured) [W]", line=dict(dash="dash")), row=3, col=1)
 
     fig.add_trace(go.Scatter(x=d, y=wind, name="Headwind [m/s]"), row=4, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=d, y=rho, name="ρ [kg/m³]", line=dict(dash="dash")), row=4, col=1, secondary_y=True)
@@ -4053,7 +5114,7 @@ def plot_profiles(result, highlight_climbs=False):
     fig.update_layout(height=1500, margin=dict(l=30, r=20, t=40, b=30), legend=dict(orientation="h"))
 
     if highlight_climbs:
-        _add_ride_type_shading(fig, d, ride_type)
+        _add_slope_type_shading(fig, d, slope_type)
 
     return fig
 
@@ -4132,13 +5193,23 @@ def plot_distributions(result, max_speed=120.0, max_pwr=1500.0):
 
 
 def plot_segments(result):
-    segs = result.get("segments_5km", [])
+    # segs = result.get("segments_5km", [])
+    
+    # """Build 5 km segments from filtered arrays and compute metrics."""
+    # filtered_dists = filtered["filtered_dists"]
+    # filtered_speeds_kph = filtered["filtered_speeds_kph"]
+    # filtered_powers = filtered["filtered_powers"]
+    # filtered_pwr_details = filtered["filtered_pwr_details"]
+    # filtered_grades = filtered["filtered_grades"]
+    # filtered_smoothed_alts = filtered["filtered_smoothed_alts"]
+    # filtered_power_meas_w = filtered_sensors.get("filtered_power_meas_w", np.zeros_like(filtered_dists))
+    segs = _build_5km_segments(result, seg_size_km=st.session_state.get("plot_segments_km", 5.0))
     if not segs:
         return go.Figure().add_annotation(
             text="No 5 km segments available", x=0.5, y=0.5, showarrow=False
         )
 
-    labels = [f"{s.get('start_km',0):.0f}-{s.get('end_km',0):.0f} km" for s in segs]
+    labels = [f"{s.get('start_km',0):.1f}-{s.get('end_km',0):.1f} km" for s in segs]
     x0 = np.arange(len(labels), dtype=float)
 
     # signed component powers (IMPORTANT: keep original signs)
@@ -4151,6 +5222,7 @@ def plot_segments(result):
     p_b  = np.array([s.get("avg_pwr_b_w",  0.0) for s in segs], float)
 
     p_tot = np.array([s.get("avg_power_w", 0.0) for s in segs], float)
+    p_tot_meas = np.array([s.get("avg_pwr_meas", 0.0) for s in segs], float)
 
     components = [
         ("Acceleration", p_a),
@@ -4162,6 +5234,7 @@ def plot_segments(result):
         ("Braking",      p_b),
     ]
 
+    print(components)
     # visual parameters
     base_width = 0.90
     shrink = 0.10
@@ -4172,35 +5245,77 @@ def plot_segments(result):
 
     fig = go.Figure()
 
-    # running signed stack
-    base = np.zeros(len(x0), dtype=float)
+    # components: list of (name, y_array) where each y_array is len N
+    # labels: list/array len N (e.g., "0-5 km", "5-10 km", ...)
+    # right_edge, base_width: your geometry stuff
+
+    N = len(labels)
+
+    # ---------- 1) build the waterfall bars (no hover) ----------
+    base = np.zeros(N, dtype=float)
+
+    # store all deltas for later hover aggregation
+    comp_names = [name for name, _ in components]
+    comp_deltas = []
 
     for i, (name, y) in enumerate(components):
         y = np.asarray(y, dtype=float)
+        comp_deltas.append(y.copy())
+
         width = max(min_width, base_width - i * shrink)
 
-        # RIGHT-ALIGNED centers
-        x = right_edge - 0.5 * width
+        x_center = right_edge - 0.5 * width
+        x_arr = np.full(N, x_center, dtype=float)
 
         fig.add_trace(go.Bar(
-            x=x,
+            x=x_arr,
             y=y,
             base=base,
             width=width,
             name=name,
-            opacity=0.9,
-            hovertemplate=(
-                f"{name}<br>"
-                "%{customdata}<br>"
-                "Δ = %{y:.1f} W<br>"
-                "Start = %{base:.1f} W"
-                "<extra></extra>"
-            ),
-            customdata=labels,
+            opacity=1.0,
+            hoverinfo="skip",          # <--- important: disable hover here
+            showlegend=True,
         ))
 
-        # advance running sum (THIS is the stacking rule)
         base = base + y
+
+    total_stack = base.copy()  # end result per segment (sum of all components)
+
+    # ---------- 2) add ONE wide transparent "hover carrier" trace ----------
+    # customdata columns: [label, total, comp1, comp2, ...]
+    custom = np.column_stack(
+        [np.asarray(labels, dtype=object), total_stack] + comp_deltas
+    )
+
+    # Build hovertemplate: one line per component + total at the end
+    lines = [
+        "%{customdata[0]}",                          # label
+        "<br><b>Total:</b> %{customdata[1]:.1f} W",  # total
+    ]
+    # components start at customdata[2]
+    for k, name in enumerate(comp_names):
+        lines.append(f"<br>{name}: %{{customdata[{2+k}]:.1f}} W")
+
+    hovertemplate = "".join(lines) + "<extra></extra>"
+
+    # Put the hover carrier at y=total_stack so it spans the stack height
+    # Use full width so it's easy to hit, and transparent so it doesn't change visuals
+    fig.add_trace(go.Bar(
+        x=np.full(N, right_edge - 0.5 * base_width, dtype=float),
+        y=total_stack,
+        base=np.zeros(N, dtype=float),
+        width=base_width,
+        marker=dict(color="rgba(0,0,0,0)"),
+        name="",
+        showlegend=False,
+        customdata=custom,
+        hovertemplate=hovertemplate,
+    ))
+
+    # Optional: make sure hover snaps nicely
+    fig.update_layout(barmode="overlay", hovermode="x")
+
 
     # total power reference
     fig.add_trace(go.Scatter(
@@ -4210,11 +5325,20 @@ def plot_segments(result):
         mode="lines+markers",
         hovertemplate="%{x}<br>%{y:.0f} W<extra></extra>",
     ))
+    fig.add_trace(go.Scatter(
+        x=x0,
+        y=p_tot_meas,
+        name="Avg. measured power",
+        mode="lines+markers",
+        hovertemplate="%{x}<br>%{y:.0f} W<extra></extra>",
+    ))
+    
 
+    seg_size = st.session_state.get("plot_segments_km", 5.0),
     fig.update_layout(
         barmode="overlay",  # stacking is manual via base=
-        title="5 km segments – Power Components",
-        xaxis_title="5 km segments",
+        title=f"{seg_size[0]} km segments – Power Components",
+        xaxis_title=f"{seg_size[0]} km segments",
         yaxis_title="Average power [W]",
         height=1500,
         margin=dict(l=30, r=20, t=60, b=120),
@@ -4710,6 +5834,11 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
     elif mode.startswith("Climbs"):
         values_full = np.asarray(result["filtered_grades"], dtype=float)
         caption = "Grade [%]"
+    elif mode.startswith("Cornering"):
+        # For the generic colorbar-based mode you'd use bearings,
+        # but for "climb-like" coloring we will use filtered_corner_type below.
+        values_full = np.asarray(result.get("filtered_bearings_degs", result["filtered_speeds_kph"]), dtype=float)
+        caption = "Bearing [°]"
     elif mode == "None (single color)":
         values_full = None
         caption = ""
@@ -4735,30 +5864,81 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
 
     positions = list(zip(lats.tolist(), lons.tolist()))
 
-    # climb/downhill masks if needed
+    # --------------------------
+    # climb/downhill masks (filtered space, distance-based)
+    # --------------------------
     is_climb_full = np.zeros_like(d_full, dtype=bool)
     combined_climbs = result.get("combined_climbs", result.get("climbs", []))
     for c in (combined_climbs or []):
-        x0 = c.get("start_distance_km", 0.0)
-        x1 = c.get("end_distance_km", 0.0)
+        x0 = float(c.get("start_distance_km", 0.0))
+        x1 = float(c.get("end_distance_km", 0.0))
+        if x1 < x0:
+            x0, x1 = x1, x0
         is_climb_full |= (d_full >= x0) & (d_full <= x1)
     is_climb = is_climb_full[idx] if len(is_climb_full) == len(d_full) else np.zeros_like(idx, dtype=bool)
 
     is_downhill_full = np.zeros_like(d_full, dtype=bool)
     combined_downhills = result.get("combined_downhills", result.get("downhills", []))
     for c in (combined_downhills or []):
-        x0 = c.get("start_distance_km", 0.0)
-        x1 = c.get("end_distance_km", 0.0)
+        x0 = float(c.get("start_distance_km", 0.0))
+        x1 = float(c.get("end_distance_km", 0.0))
+        if x1 < x0:
+            x0, x1 = x1, x0
         is_downhill_full |= (d_full >= x0) & (d_full <= x1)
     is_downhill = is_downhill_full[idx] if len(is_downhill_full) == len(d_full) else np.zeros_like(idx, dtype=bool)
 
+    # --------------------------
+    # Corner severity (filtered space, sample-based)
+    # Uses result["filtered_corner_type"] which must align with filtered arrays.
+    # --------------------------
+    corner_type_full = np.asarray(result.get("filtered_corner_type", None), dtype=object)
+    has_corner = (corner_type_full is not None) and (len(corner_type_full) == len(d_full))
+
+    if has_corner:
+        # Adjust to your exact labels. Unknown labels -> 0 (straight).
+        sev_map = {
+            "level": 0,
+            "none": 0,
+            "straight": 0,
+            "gentle": 1,
+            "corner_gentle": 1,
+            "medium": 2,
+            "corner_medium": 2,
+            "tight": 3,
+            "corner_tight": 3,
+        }
+        sev_full = np.zeros(len(d_full), dtype=int)
+        for i_, t_ in enumerate(corner_type_full):
+            sev_full[i_] = sev_map.get(str(t_), 0)
+        sev = sev_full[idx]
+    else:
+        sev = None
+
+    # --------------------------
+    # Draw polyline with special modes
+    # --------------------------
     if mode.startswith("Climbs") and ((combined_climbs or []) or (combined_downhills or [])):
         for i in range(len(positions) - 1):
             in_climb = bool(is_climb[i] or is_climb[i + 1])
             in_down = bool(is_downhill[i] or is_downhill[i + 1])
             color = "red" if in_climb else ("green" if in_down else "blue")
             folium.PolyLine([positions[i], positions[i + 1]], color=color, weight=4, opacity=0.9).add_to(m)
+
+    elif mode.startswith("Cornering") and (sev is not None):
+        # severity colors: easy to distinguish on map
+        col_by_sev = {
+            0: "blue",       # straight
+            1: "#f1c40f",    # gentle (yellow)
+            2: "#e67e22",    # medium (orange)
+            3: "#8e44ad",    # tight (purple)
+        }
+        for i in range(len(positions) - 1):
+            s = int(max(sev[i], sev[i + 1]))  # color segment if either endpoint is cornering
+            color = col_by_sev.get(s, "blue")
+            folium.PolyLine([positions[i], positions[i + 1]], color=color, weight=4, opacity=0.9).add_to(m)
+
     else:
+        # continuous colormap mode
         if vals is None or vals.size < 2 or np.nanmin(vals) == np.nanmax(vals):
             folium.PolyLine(positions, color="blue", weight=3, opacity=0.9).add_to(m)
         else:
@@ -4772,20 +5952,25 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
             colormap.add_to(m)
             val_list = vals.tolist()
             for i in range(len(positions) - 1):
-                folium.PolyLine([positions[i], positions[i + 1]], color=colormap(val_list[i]),
-                                weight=4, opacity=0.9).add_to(m)
+                folium.PolyLine(
+                    [positions[i], positions[i + 1]],
+                    color=colormap(val_list[i]),
+                    weight=4,
+                    opacity=0.9
+                ).add_to(m)
 
     # Start/end markers
     full_positions = list(zip(lats_full.tolist(), lons_full.tolist()))
     folium.Marker(full_positions[0], popup="Start").add_to(m)
-    folium.Marker(full_positions[-1],
-                  popup=(
-                      f"End<br>"
-                      f"Total\u00A0Duration:\u00A0{time_to_readable(t_seconds=timestamps[-1].timestamp() - timestamps[0].timestamp())}<br>"
-                      f"Ride\u00A0Duration:\u00A0{time_to_readable(t_minutes=(timestamps[-1].timestamp()/60. - timestamps[0].timestamp()/60.)-total_break_duration)}<br>"
-                      f"Break\u00A0Duration:\u00A0{time_to_readable(t_minutes=total_break_duration)}<br>"
-                         )
-                  ).add_to(m)
+    folium.Marker(
+        full_positions[-1],
+        popup=(
+            f"End<br>"
+            f"Total\u00A0Duration:\u00A0{time_to_readable(t_seconds=timestamps[-1].timestamp() - timestamps[0].timestamp())}<br>"
+            f"Ride\u00A0Duration:\u00A0{time_to_readable(t_minutes=(timestamps[-1].timestamp()/60. - timestamps[0].timestamp()/60.)-total_break_duration)}<br>"
+            f"Break\u00A0Duration:\u00A0{time_to_readable(t_minutes=total_break_duration)}<br>"
+        )
+    ).add_to(m)
 
     # Distance markers
     if marker_spacing_km > 0 and d_full.size > 0:
@@ -4815,34 +6000,19 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
         current["break_count"] = 1  # number of merged breaks
 
         for b in breaks_sorted[1:]:
-            # time difference between end of current cluster and start of next break
             dt_min = b["time_min"] - (current["time_min"] + current["duration_min"])
             try:
-                dist_m = geodesic(
-                    (current["lat"], current["lon"]),
-                    (b["lat"], b["lon"])
-                ).meters
+                dist_m = geodesic((current["lat"], current["lon"]), (b["lat"], b["lon"])).meters
             except ValueError:
-                # if we get bad coordinates for any reason, don't merge
                 dist_m = COMBINE_BREAK_MAX_DISTANCE + 1.0
 
             if dt_min <= COMBINE_BREAK_MAX_TIME_DIFF and dist_m <= COMBINE_BREAK_MAX_DISTANCE:
-                # merge b into current cluster with weighted averages
-                n = current["break_count"]
-
-                # total duration is just sum
+                n_ = current["break_count"]
                 current["duration_min"] += b["duration_min"]
-
-                # distance: average over breaks
-                current["distance_km"] = (current["distance_km"] * n + b["distance_km"]) / (n + 1)
-
-                # lat/lon: average over breaks
-                current["lat"] = (current["lat"] * n + b["lat"]) / (n + 1)
-                current["lon"] = (current["lon"] * n + b["lon"]) / (n + 1)
-
-                current["break_count"] = n + 1
-
-                # upgrade to long break if combined duration exceeds threshold
+                current["distance_km"] = (current["distance_km"] * n_ + b["distance_km"]) / (n_ + 1)
+                current["lat"] = (current["lat"] * n_ + b["lat"]) / (n_ + 1)
+                current["lon"] = (current["lon"] * n_ + b["lon"]) / (n_ + 1)
+                current["break_count"] = n_ + 1
                 if current["duration_min"] >= long_break_thr_min:
                     current["type"] = "long"
             else:
@@ -4863,6 +6033,7 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
         btime = b["time_min"]
         bdist = b["distance_km"]
         bcount = b.get("break_count", 1)
+
         if btype == "long":
             color = "darkgreen"
             radius = 6
@@ -4871,17 +6042,20 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
             color = "orange"
             radius = 4
             label = "Short break"
+
         folium.CircleMarker(
             location=[lat_b, lon_b],
             radius=radius,
             color=color,
             fill=True,
             fillOpacity=0.9,
-            popup=f"{label}:<br>"
+            popup=(
+                f"{label}:<br>"
                 f"Time:\u00A0{time_to_readable(t_minutes=btime)}<br>"
                 f"Duration:\u00A0{time_to_readable(t_minutes=dur)}<br>"
                 f"Distance:\u00A0{bdist:.2f}\u00A0km<br>"
                 f"{f'Combined\u00A0Breaks:\u00A0{bcount}' if bcount > 1 else ''}"
+            )
         ).add_to(m)
 
     return m, values_full, caption
@@ -5095,10 +6269,15 @@ with st.sidebar:
 
     # Basic settings
     with st.expander("Ride Environment and Date/Time", expanded=True):
+        st.session_state["use_ambient"] = st.checkbox(
+            "Use ambient data (Meteostat)",
+            value=True,
+            help="If enabled, use Meteostat temperature and humidity data. If disabled, use the ambient overrides below.\n\nDefault: on",
+        )
         st.session_state["use_wind"] = st.checkbox(
-            "Use weather data (Meteostat)",
+            "Use wind data (Meteostat)",
             value=False,
-            help="If enabled, use Meteostat weather. If disabled, use the ambient overrides below.\n\nDefault: off",
+            help="If enabled, use Meteostat wind data. If disabled, use the ambient overrides below.\n\nDefault: off",
         )
         st.session_state["USE_DATETIME_OVERRIDE"] = st.checkbox(
             "Override Start Date and Time (local)",
@@ -5163,13 +6342,22 @@ with st.sidebar:
             step=0.05,
             help=f"Aerodynamic drafting multiplier on flat terrain (1.0 = no draft, 0.8 = 20 % reduced air drag).\n\nDefault: 1.0 [-]",
         )
+        
+        st.session_state["high_speed_aero_threshold_kmh"] = st.number_input(
+            "Speed when using drops [km/h]",
+            min_value=0.0,
+            max_value=120.0,
+            value=35.0,
+            step=0.5,
+            help=f"Speed threshold above which the rider is assumed to be in the drops position (reduces drag by {DROPS_DRAG_REDUCTION}).\n\nDefault: 35.0 km/h",
+        )
         st.session_state["draft_effect_dh"] = st.number_input(
             "Downhill draft factor [-]",
             min_value=0.0,
             max_value=1.5,
             value=1.0,
             step=0.05,
-            help="Drafting downhill?! Who does this?\n\nDefault: 1.0 [-]",
+            help="Drafting downhill?! Who does this? Use this to adapt drag according to your seating position during downhills.\n\nDefault: 1.0 [-]",
         )
         st.session_state["draft_effect_uh"] = st.number_input(
             "Uphill draft factor [-]",
@@ -5177,7 +6365,7 @@ with st.sidebar:
             max_value=1.5,
             value=1.0,
             step=0.05,
-            help="Drafting uphill? consider pro career!\n\nDefault: 1.0 [-]",
+            help="Drafting uphill? Who does this? Use this to adapt drag according to your seating position during climbs.\n\nDefault: 1.0 [-]",
         )
         st.session_state["target_cadence"] = st.number_input(
             "Target cadence [RPM]",
@@ -5185,7 +6373,12 @@ with st.sidebar:
             max_value=140,
             value=85,
             step=1,
-            help="Cadence the rider tries to maintain during active pedaling.\n\nDefault: 85 RPM",
+            help="Cadence the simulator tries to maintain during active pedaling.\n\nUsed for shifting calculations. \n\nDefault: 85 RPM",
+        )
+        st.session_state["use_meas_cad"] = st.checkbox(
+            "Use cadence from input file if available",
+            value=True,
+            help="If enabled, use cadence from input file if available. If disabled, use the target cadence.\n\nDefault: on",
         )
 
     with st.expander("Bike", expanded=True):
@@ -5207,13 +6400,13 @@ with st.sidebar:
         )
         st.session_state["front_teeth"] = st.text_input(
             "Front teeth (comma-separated)",
-            value="34,50",
-            help='Chainring tooth counts, comma-separated. Example: "34,50".\n\nDefault: 34,50',
+            value=DEFAULT_FRONT_DERAILLEUR_TEETH,
+            help=f'Chainring tooth counts, comma-separated. Example: "{DEFAULT_FRONT_DERAILLEUR_TEETH}".\n\nDefault: 34,50',
         )
         st.session_state["rear_teeth"] = st.text_input(
             "Rear teeth (comma-separated)",
-            value="11,12,13,14,15,17,19,21,24,28,32",
-            help='Cassette tooth counts, comma-separated. Example: "11,12,13,...".\n\nDefault: 11,12,13,14,15,17,19,21,24,28,32',
+            value=DEFAULT_REAR_DERAILLEUR_TEETH,
+            help=f'Cassette tooth counts, comma-separated. Example: "11,12,13,...".\n\nDefault: {DEFAULT_REAR_DERAILLEUR_TEETH}',
         )
         st.session_state["BRAKE_FRONT_DIAMETER_MM"] = st.number_input(
             "Front brake dia [mm]",
@@ -5259,7 +6452,7 @@ with st.sidebar:
             format="%.1f",
             help=(
                 "Rim Weight (used by the inertia model).\n\n"
-                f"Default: {DEFAULT_RIM_WEIGHT_G:.1f} W"
+                f"Default: {DEFAULT_RIM_WEIGHT_G:.1f} g"
             ),
         )
         st.session_state["TUBE_WEIGHT"] = st.number_input(
@@ -5271,19 +6464,19 @@ with st.sidebar:
             format="%.1f",
             help=(
                 "Tube Weight (used by the inertia model).\n\n"
-                f"Default: {DEFAULT_TUBE_WEIGHT_G:.1f} W"
+                f"Default: {DEFAULT_TUBE_WEIGHT_G:.1f} g"
             ),
         )
         st.session_state["TIRE_WEIGHT"] = st.number_input(
             "Single Tire Weight [g]",
             min_value=0.0,
-            max_value=1000.0,
+            max_value=2000.0,
             value=float(DEFAULT_TIRE_WEIGHT_G),
             step=1.,
             format="%.1f",
             help=(
                 "Tire Weight (used by the inertia model).\n\n"
-                f"Default: {DEFAULT_TIRE_WEIGHT_G:.1f} W"
+                f"Default: {DEFAULT_TIRE_WEIGHT_G:.1f} g"
             ),
         )
 
@@ -5542,6 +6735,14 @@ with st.sidebar:
         )
 
     with st.expander("Advanced settings", expanded=False):
+        st.session_state["DROPS_DRAG_REDUCTION"] = st.number_input(
+            "Drops drag reduction [-]",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.2,
+            step=0.05,
+            help=f"Drag reduction factor when using drops position (0.2 = 20% reduction; applied above speed threshhold).\n\nDefault: {DROPS_DRAG_REDUCTION:.2f} [-]",
+        )
         st.session_state["long_break_threshold_min"] = st.number_input(
             "Long break threshold [min]",
             min_value=1.0,
@@ -5578,13 +6779,37 @@ with st.sidebar:
             step=1000,
             help=f"Subsample limit for map drawing to keep Folium responsive.\n\nDefault: {DEFAULT_MAX_MAP_POINTS:d}",
         )
-        st.session_state["SMOOTHING_WINDOW_SIZE_S"] = st.number_input(
-            "Smoothing window [s]",
+        st.session_state["SMOOTHING_WINDOW_SIZE_S_GPX_TCX"] = st.number_input(
+            "Smoothing window for GPX/TCX [s]",
             min_value=1.0,
             max_value=20.0,
-            value=float(DEFAULT_SMOOTHING_WINDOW_SIZE_S),
+            value=2.0,
             step=1.0,
-            help=f"Smoothing window length for speed/grade/altitude filtering.\n\nDefault: {DEFAULT_SMOOTHING_WINDOW_SIZE_S:.1f} s",
+            help=f"Smoothing window length for speed filtering. GPX is noisy.\n\nDefault: 2.0 s",
+        )
+        st.session_state["SMOOTHING_WINDOW_SIZE_ALT_S_GPX_TCX"] = st.number_input(
+            "Smoothing window for altitude (GPX/TCX) [s]",
+            min_value=1.0,
+            max_value=20.0,
+            value=6.0,
+            step=1.0,
+            help=f"Smoothing window length for altitude filtering. Some vendors have already strong filtering.\n\nDefault: 6.0 s",
+        )
+        st.session_state["SMOOTHING_WINDOW_SIZE_S_FIT"] = st.number_input(
+            "Smoothing window for FIT [s]",
+            min_value=1.0,
+            max_value=20.0,
+            value=1.0,
+            step=1.0,
+            help=f"Smoothing window length for speed filtering. FIT files are usually very good.\n\nDefault: 1.0 s",
+        )
+        st.session_state["SMOOTHING_WINDOW_SIZE_ALT_S_FIT"] = st.number_input(
+            "Smoothing window for altitude (FIT) [s]",
+            min_value=1.0,
+            max_value=20.0,
+            value=2.0,
+            step=1.0,
+            help=f"Smoothing window length for altitude filtering. Some vendors have already strong filtering.\n\nDefault: 2.0 s",
         )
 
         st.session_state["BRAKE_ADD_COOLING_FACTOR"] = st.number_input(
@@ -5621,8 +6846,8 @@ with st.sidebar:
 col_u1, col_u2 = st.columns([2, 3], vertical_alignment="top")
 
 with col_u1:
-    st.subheader("Upload GPX")
-    uploads = st.file_uploader("Select GPX files", type=["gpx"], accept_multiple_files=True)
+    st.subheader("Upload GPX/TCX/FIT")
+    uploads = st.file_uploader("Select GPX/TCX/FIT files", type=["gpx", "tcx", "fit"], accept_multiple_files=True)
 
     # Persist uploads into session_state (so they survive reruns)
     if uploads:
@@ -5677,11 +6902,7 @@ with col_u1:
                 result = analyze_gpx_file(
                     tmp_path,
                     cfg=cfg,
-                    target_cadence=int(st.session_state["target_cadence"]),
-                    use_wind_data=bool(st.session_state["use_wind"]),
-                    break_threshold_min=float(st.session_state["long_break_threshold_min"]),
-                    progress_cb=None,
-                    simulate=bool(st.session_state["USE_DRIVER_SIMULATOR"])
+                    progress_cb=prog.progress,
                 )
                 if result is not None:
                     st.session_state["results"][key] = result
@@ -5736,7 +6957,7 @@ with col_u2:
                     "Avg climb P [W]": float(r.get("avg_climb_power_w", 0.0)),
                     "Best 5 km P [W]": float(r.get("best_segment_5km_power_w", 0.0)),
                 })
-            st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+            st.dataframe(pd.DataFrame(rows), hide_index=True)
 
 
 # ---------------- Main content for selected ride ----------------
@@ -5778,13 +6999,13 @@ if key and key in st.session_state["results"]:
     with c4:
         st.metric("Calories (activity)", f"{kcal_cum:.0f} kcal")
         st.metric("Calories (base)", f"{kcal_base:.0f} kcal")
-        st.metric("Calories (total)", f"{kcal_total:.0f} kcal")
+        st.metric("Calories (total)", f"{kcal_total:.0f} kcal", help=fun_energy_tooltip(kcal_total))
         # If you want the fun tooltip: put it in an expander/text
-        with st.expander("Fun equivalents 🍝", expanded=False):
-            try:
-                st.markdown(fun_energy_tooltip(kcal_total))
-            except Exception:
-                st.write("(fun tooltip unavailable - missing helper)")
+        # with st.expander("Fun equivalents 🍝", expanded=False):
+        #     try:
+        #         st.markdown(fun_energy_tooltip(kcal_total))
+        #     except Exception:
+        #         st.write("(fun tooltip unavailable - missing helper)")
 
     # tabs like Qt
     tabs = st.tabs(["Profiles", "Segments", "Distributions", "Energy Balance", "Mechanical", "Human Body", "Environment", "Climbs & Downhills", "Map", "Details", "Log"])
@@ -5805,12 +7026,12 @@ if key and key in st.session_state["results"]:
         if pdf_bytes:
             ride_name = st.session_state.get("uploads_name", {}).get(key, key)
             safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", ride_name)
-            st.download_button(
-                label="Download PDF report",
-                data=pdf_bytes,
-                file_name=f"GPX_Report_{safe_name}.pdf",
-                mime="application/pdf",
-            )
+        st.download_button(
+            label="Download PDF report",
+            data=pdf_bytes,
+            file_name=f"GPX_Report_{safe_name}.pdf",
+            mime="application/pdf",
+        )
 
     if build_pdf:
         with st.spinner("Creating PDF..."):
@@ -5841,6 +7062,14 @@ if key and key in st.session_state["results"]:
         st.plotly_chart(fig, width='stretch')
 
     with tabs[1]:
+        st.session_state["plot_segments_km"] = st.number_input(
+                "Segmentation Size [km]",
+                min_value=0.1,
+                max_value=100.0,
+                value=5.0,
+                step=0.5,
+                help="Size of segments to average powers for plotting.\n\nDefault: 5.0 km",
+            )
         fig = plot_segments(result)
         st.plotly_chart(fig, width='stretch')
 
@@ -5869,13 +7098,13 @@ if key and key in st.session_state["results"]:
 
         with sub_up:
             fig_up, tbl_up = plot_climb_stat_grouped(result, mode="climb", top_n=None)
-            st.plotly_chart(fig_up, width="stretch")
-            st.plotly_chart(tbl_up, width="stretch")
+            st.plotly_chart(fig_up, width="stretch", key="uphill_charts")
+            st.plotly_chart(tbl_up, width="stretch", key="uphill_table")
 
         with sub_down:
             fig_dn, tbl_dn = plot_climb_stat_grouped(result, mode="downhill", top_n=None)
-            st.plotly_chart(fig_dn, width="stretch")
-            st.plotly_chart(tbl_dn, width="stretch")
+            st.plotly_chart(fig_dn, width="stretch", key="downhill_charts")
+            st.plotly_chart(tbl_dn, width="stretch", key="downhill_table")
 
 
     with tabs[8]:
@@ -5892,6 +7121,7 @@ if key and key in st.session_state["results"]:
                     "Air density [kg/m³]",
                     "Cadence [RPM]",
                     "Climbs (segments)",
+                    "Cornering",
                     "None (single color)",
                 ],
                 index=0
