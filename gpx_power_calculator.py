@@ -7026,12 +7026,12 @@ if key and key in st.session_state["results"]:
         if pdf_bytes:
             ride_name = st.session_state.get("uploads_name", {}).get(key, key)
             safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", ride_name)
-        st.download_button(
-            label="Download PDF report",
-            data=pdf_bytes,
-            file_name=f"GPX_Report_{safe_name}.pdf",
-            mime="application/pdf",
-        )
+            st.download_button(
+                label="Download PDF report",
+                data=pdf_bytes,
+                file_name=f"GPX_Report_{safe_name}.pdf",
+                mime="application/pdf",
+            )
 
     if build_pdf:
         with st.spinner("Creating PDF..."):
