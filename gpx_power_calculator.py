@@ -71,8 +71,8 @@ DEFAULT_MAX_GRADE, MAX_GRADE = 35.0, 35.0           # % absolute max grade for f
 DEFAULT_MAX_PWR, MAX_PWR = 1200.0, 1200.0           # W for filters & histograms
 
 DEFAULT_TARGET_CADENCE = 85.   # RPM
-DEFAULT_HYSTERESIS_REAR_RPM, HYSTERESIS_REAR_RPM = 15., 15.      # RPM hysteresis for rear shifts
-DEFAULT_MIN_SHIFT_INTERVAL_REAR_SEC, MIN_SHIFT_INTERVAL_REAR_SEC = 15., 15.  # s min time between rear shifts
+DEFAULT_HYSTERESIS_REAR_RPM, HYSTERESIS_REAR_RPM = 10., 10.      # RPM hysteresis for rear shifts
+DEFAULT_MIN_SHIFT_INTERVAL_REAR_SEC, MIN_SHIFT_INTERVAL_REAR_SEC = 20., 20.  # s min time between rear shifts
 
 # Speeds used in filtering
 DEFAULT_MIN_ACTIVE_SPEED, MIN_ACTIVE_SPEED = 1.0, 1.0     # km/h: above this counts as "active" riding
@@ -4506,6 +4506,8 @@ def _gear_simulation(filtered, filtered_sensors, cfg, target_cadence, exclude_do
 
     if not target_cadence:
         target_cadence = filtered_sensors["filtered_cad_meas_rpm"]
+        HYSTERESIS_REAR_RPM = 1.0  # smaller hysteresis when following measured cadence
+        MIN_SHIFT_INTERVAL_REAR_SEC = 1.0  # smaller hysteresis when following measured cadence
     else:
         #make array from single target cadence value
         target_cadence = np.full(len(filtered_speeds_kph), target_cadence, dtype=float)
@@ -6644,6 +6646,9 @@ def plot_mechanical(result):
 
     front_teeth = _arr(result.get("selected_front_teeth", None))
     rear_teeth  = _arr(result.get("selected_rear_teeth", None))
+    cad_calc = _arr(result.get("selected_cadences", None))
+    cad_meas = _arr(result.get("filtered_cad_meas_rpm", None))
+
     tf = _arr(result.get("filtered_temp_front_disk_c", None))
     tr = _arr(result.get("filtered_temp_rear_disk_c", None))
 
@@ -6656,25 +6661,31 @@ def plot_mechanical(result):
 
     ft = clip_to_d(front_teeth)
     rt = clip_to_d(rear_teeth)
+    cad_calc = clip_to_d(cad_calc)
+    cad_meas = clip_to_d(cad_meas)
     tf = clip_to_d(tf)
     tr = clip_to_d(tr)
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-                        subplot_titles=("Gear Selection vs Distance", "Brake Disk Temperatures vs Distance"))
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                        subplot_titles=("Gear Selection vs Distance", "Cadence", "Brake Disk Temperatures vs Distance"))
 
     if ft is not None:
         fig.add_trace(go.Scatter(x=d[:len(ft)], y=ft, name="Front teeth"), row=1, col=1)
     if rt is not None:
         fig.add_trace(go.Scatter(x=d[:len(rt)], y=rt, name="Rear teeth"), row=1, col=1)
-
+    if cad_calc is not None:
+        fig.add_trace(go.Scatter(x=d[:len(cad_calc)], y=cad_calc, name="Cadence calc [RPM]"), row=2, col=1)
+    if cad_meas is not None:
+        fig.add_trace(go.Scatter(x=d[:len(cad_meas)], y=cad_meas, name="Cadence meas [RPM]"), row=2, col=1)
     if tf is not None:
-        fig.add_trace(go.Scatter(x=d[:len(tf)], y=tf, name="Front disk temp [°C]"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=d[:len(tf)], y=tf, name="Front disk temp [°C]"), row=3, col=1)
     if tr is not None:
-        fig.add_trace(go.Scatter(x=d[:len(tr)], y=tr, name="Rear disk temp [°C]"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=d[:len(tr)], y=tr, name="Rear disk temp [°C]"), row=3, col=1)
 
     fig.update_yaxes(title_text="Teeth", row=1, col=1)
-    fig.update_yaxes(title_text="Temp [°C]", row=2, col=1)
-    fig.update_xaxes(title_text="Distance [km]", row=2, col=1)
+    fig.update_yaxes(title_text="Cadence [RPM]", row=2, col=1)
+    fig.update_yaxes(title_text="Temp [°C]", row=3, col=1)
+    fig.update_xaxes(title_text="Distance [km]", row=3, col=1)
 
     fig.update_layout(height=650, margin=dict(l=30, r=20, t=60, b=30), legend=dict(orientation="h"))
     return fig
