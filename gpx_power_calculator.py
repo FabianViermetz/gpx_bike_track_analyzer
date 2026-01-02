@@ -699,9 +699,9 @@ def compute_disk_temperature(ambient_temp_c, speed_kph, headwind, brake_power_w,
     disk_f_temps_K = [initial_disk_temp_c + 273.15]
     disk_r_temps_K = [initial_disk_temp_c + 273.15]
 
-    speed_kph = moving_average(speed_kph, window_size=10)
-    headwind = moving_average(headwind, window_size=10)
-    brake_power_w = moving_average(brake_power_w, window_size=10)
+    speed_kph = moving_average(speed_kph, window_size=1)
+    headwind = moving_average(headwind, window_size=1)
+    brake_power_w = moving_average(brake_power_w, window_size=1)
     for t_amb, v_kph, v_wind, p_brake_w, dt_s in zip(ambient_temp_c, speed_kph, headwind, brake_power_w, np.diff(times_s, prepend=times_s[0])):
         #front disk
         # p_brake_w = -215 /BRAKE_DISTRIBUTION_FRONT
@@ -781,20 +781,29 @@ def get_meteostat_series(latitudes, longitudes, times,
                          use_ambient_data=True,
                          use_wind_data=False):
     """
+    Drop-in replacement.
+
     Returns per-time arrays for the given GPX times:
-    dict with keys: 'wspd_ms', 'wdir_deg', 'temp_c', 'pres_hpa', 'rhum_pct', 'rho'
+    dict with keys:
+      'wspd_ms', 'wdir_deg', 'temp_c', 'pres_hpa', 'rhum_pct', 'rho',
+      plus: 'tsun_min'  (sunshine duration / exposure time in minutes per hour)
+
     All arrays have len(times).
 
-    Weather is taken from a single Meteostat point (midpoint of track).
-    Wind data is only used if use_wind_data=True.
+    Optional globals (safe defaults if not defined):
+      METEO_REEVAL_EVERY_KM   (float or None) default 10.0
+      METEO_REEVAL_EVERY_MIN  (float or None) default None
+      METEO_ANCHOR_BLEND      (bool) default True
+      METEO_TIME_INTERP       (bool) default True
+      METEO_CROSSFADE_M       (float) default 3000.0
     """
-    idx = pd.to_datetime(times)
 
-    # ------------------------------------------------------------
-    # Full fallback: no ambient data at all
-    # ------------------------------------------------------------
-    if not use_ambient_data:
-        n = len(times)
+    # ---------- robust time basis: naive UTC ----------
+    idx = pd.to_datetime(times, utc=True).tz_convert(None)
+    n = len(idx)
+
+    # ---------- Full fallback: no ambient data ----------
+    if (not use_ambient_data) or n == 0:
         return {
             "wspd_ms":  np.full(n, AMBIENT_WIND_SPEED_MS),
             "wdir_deg": np.full(n, AMBIENT_WIND_DIR_DEG),
@@ -802,102 +811,359 @@ def get_meteostat_series(latitudes, longitudes, times,
             "pres_hpa": np.full(n, AMBIENT_PRES_HPA),
             "rhum_pct": np.full(n, AMBIENT_RHUM_PCT),
             "rho":      np.full(n, AMBIENT_RHO),
+            "tsun_min": np.full(n, 0.0),
         }
 
-    mid_lat = float(np.mean(latitudes))
-    mid_lon = float(np.mean(longitudes))
+    # ---------- Optional controls via globals ----------
+    step_km     = globals().get("METEO_REEVAL_EVERY_KM", 10.0)        # None disables
+    step_min    = globals().get("METEO_REEVAL_EVERY_MIN", 30)       # None disables
+    do_blend    = bool(globals().get("METEO_ANCHOR_BLEND", True))
+    do_tinterp  = bool(globals().get("METEO_TIME_INTERP", True))
+    crossfade_m = float(globals().get("METEO_CROSSFADE_M", 3000.0))   # smooth anchor transitions
 
-    point = Point(mid_lat, mid_lon)
-    start = min(times).replace(tzinfo=None) - timedelta(hours=1)
-    end   = max(times).replace(tzinfo=None) + timedelta(hours=1)
+    latitudes  = np.asarray(latitudes, dtype=float)
+    longitudes = np.asarray(longitudes, dtype=float)
 
-    print(
-        f"Fetching Meteostat data for {mid_lat:.4f}, {mid_lon:.4f} "
-        f"from {start} to {end} "
-        f"(wind={'on' if use_wind_data else 'off'})"
-    )
+    # ---------- distance helper (meters) ----------
+    EARTH_R = 6371000.0
 
-    try:
-        data = Hourly(point, start, end)
-        df = data.fetch()
+    def _haversine_m(lat1, lon1, lat2, lon2):
+        lat1 = np.deg2rad(lat1); lon1 = np.deg2rad(lon1)
+        lat2 = np.deg2rad(lat2); lon2 = np.deg2rad(lon2)
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = np.sin(dlat/2.0)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2.0)**2
+        c = 2.0*np.arcsin(np.sqrt(a))
+        return EARTH_R * c
 
-        # ------------------------------------------------------------
-        # Required columns depend on wind usage
-        # ------------------------------------------------------------
-        required = ['temp', 'pres', 'rhum']
+    # ---------- if anchors disabled -> midpoint ----------
+    use_anchors = ((step_km is not None and step_km > 0) or (step_min is not None and step_min > 0))
+    if not use_anchors:
+        mid_lat = float(np.mean(latitudes))
+        mid_lon = float(np.mean(longitudes))
+        point = Point(mid_lat, mid_lon)
+
+        start = idx.min().to_pydatetime() - timedelta(hours=1)
+        end   = idx.max().to_pydatetime() + timedelta(hours=1)
+
+        # NOTE: tsun is optional coverage-wise -> don't require it, but try to fetch it
+        required = ['temp', 'pres', 'rhum'] + (['wspd', 'wdir'] if use_wind_data else [])
+        optional = ['tsun']
+
+        try:
+            df = Hourly(point, start, end).fetch()
+
+            for col in required:
+                if col not in df.columns:
+                    raise ValueError(f"Meteostat data missing column '{col}'")
+
+            for col in optional:
+                if col not in df.columns:
+                    df[col] = np.nan
+
+            df = df[required + optional].copy().ffill().bfill()
+            df['rho'] = air_density_from_meteostat(df['temp'], df['pres'], df['rhum'])
+
+            # force Meteostat index to naive UTC too
+            df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
+
+            def _interp_time(df_, t_, col_):
+                if df_ is None or len(df_.index) == 0:
+                    return None
+                if t_ < df_.index[0] or t_ > df_.index[-1]:
+                    return None
+
+                if not do_tinterp:
+                    v = df_.loc[:t_].iloc[-1][col_]
+                    return None if pd.isna(v) else float(v)
+
+                j = df_.index.searchsorted(t_)
+                if j == 0:
+                    v = df_.iloc[0][col_]; return None if pd.isna(v) else float(v)
+                if j >= len(df_.index):
+                    v = df_.iloc[-1][col_]; return None if pd.isna(v) else float(v)
+                t1 = df_.index[j-1]; t2 = df_.index[j]
+                y1 = df_.loc[t1, col_]; y2 = df_.loc[t2, col_]
+                if pd.isna(y1) and pd.isna(y2): return None
+                if pd.isna(y1): return float(y2)
+                if pd.isna(y2): return float(y1)
+                w = (t_ - t1) / (t2 - t1)
+                return float((1-w)*y1 + w*y2)
+
+            out_temp = np.empty(n, float)
+            out_pres = np.empty(n, float)
+            out_rhum = np.empty(n, float)
+            out_rho  = np.empty(n, float)
+            out_wspd = np.empty(n, float)
+            out_wdir = np.empty(n, float)
+            out_tsun = np.empty(n, float)
+
+            for k, t in enumerate(idx):
+                temp = _interp_time(df, t, 'temp')
+                pres = _interp_time(df, t, 'pres')
+                rhum = _interp_time(df, t, 'rhum')
+                rho  = _interp_time(df, t, 'rho')
+                tsun = _interp_time(df, t, 'tsun')
+
+                if temp is None: temp = AMBIENT_TEMP_C
+                if pres is None: pres = AMBIENT_PRES_HPA
+                if rhum is None: rhum = AMBIENT_RHUM_PCT
+                if rho  is None: rho  = AMBIENT_RHO
+                if tsun is None: tsun = 0.0
+
+                if use_wind_data:
+                    wspd = _interp_time(df, t, 'wspd')
+                    wdir = _interp_time(df, t, 'wdir')
+                    if wspd is None: wspd = 0.0
+                    if wdir is None: wdir = 0.0
+                    wspd = float(wspd) / 3.6
+                    wdir = float(wdir)
+                else:
+                    wspd = AMBIENT_WIND_SPEED_MS
+                    wdir = AMBIENT_WIND_DIR_DEG
+
+                out_temp[k] = temp
+                out_pres[k] = pres
+                out_rhum[k] = rhum
+                out_rho[k]  = rho
+                out_wspd[k] = wspd
+                out_wdir[k] = wdir
+                out_tsun[k] = tsun
+
+            return {
+                "wspd_ms":  out_wspd,
+                "wdir_deg": out_wdir,
+                "temp_c":   out_temp,
+                "pres_hpa": out_pres,
+                "rhum_pct": out_rhum,
+                "rho":      out_rho,
+                "tsun_min": out_tsun,
+            }
+
+        except Exception as e:
+            print(f"[Meteostat] Failed, using ambient constants. Reason: {e}")
+            return {
+                "wspd_ms":  np.full(n, AMBIENT_WIND_SPEED_MS),
+                "wdir_deg": np.full(n, AMBIENT_WIND_DIR_DEG),
+                "temp_c":   np.full(n, AMBIENT_TEMP_C),
+                "pres_hpa": np.full(n, AMBIENT_PRES_HPA),
+                "rhum_pct": np.full(n, AMBIENT_RHUM_PCT),
+                "rho":      np.full(n, AMBIENT_RHO),
+                "tsun_min": np.full(n, 0.0),
+            }
+
+    # ---------- build cumulative distance ----------
+    dist_m = np.zeros(n, dtype=float)
+    if n >= 2:
+        seg = _haversine_m(latitudes[:-1], longitudes[:-1], latitudes[1:], longitudes[1:])
+        dist_m[1:] = np.cumsum(seg)
+
+    # ---------- build anchor indices ----------
+    anchor_idx = {0, n - 1}
+
+    if step_km is not None and step_km > 0:
+        step_m = float(step_km) * 1000.0
+        next_d = dist_m[0] + step_m
+        i = 0
+        while i < n:
+            while i < n and dist_m[i] < next_d:
+                i += 1
+            if i < n:
+                anchor_idx.add(i)
+                next_d += step_m
+
+    if step_min is not None and step_min > 0:
+        step_s = float(step_min) * 60.0
+        t0 = idx[0].to_pydatetime().timestamp()
+        next_t = t0 + step_s
+        for i in range(n):
+            if idx[i].to_pydatetime().timestamp() >= next_t:
+                anchor_idx.add(i)
+                next_t += step_s
+
+    anchor_idx = sorted(anchor_idx)
+
+    # ---------- fetch Meteostat per anchor ----------
+    start = idx.min().to_pydatetime() - timedelta(hours=1)
+    end   = idx.max().to_pydatetime() + timedelta(hours=1)
+
+    required = ['temp', 'pres', 'rhum'] + (['wspd', 'wdir'] if use_wind_data else [])
+    optional = ['tsun']
+
+    anchors = []
+    for i in anchor_idx:
+        lat = float(latitudes[i]); lon = float(longitudes[i])
+        try:
+            df = Hourly(Point(lat, lon), start, end).fetch()
+
+            for col in required:
+                if col not in df.columns:
+                    df[col] = np.nan  # keep running; we’ll fallback per-sample if needed
+
+            for col in optional:
+                if col not in df.columns:
+                    df[col] = np.nan
+
+            df = df[required + optional].copy().ffill().bfill()
+            df['rho'] = air_density_from_meteostat(df['temp'], df['pres'], df['rhum'])
+            df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)  # align time basis
+        except Exception as e:
+            print(f"[Meteostat] Anchor fetch failed at {lat:.4f},{lon:.4f}: {e}")
+            df = None
+
+        anchors.append({"idx": i, "dist": float(dist_m[i]), "df": df})
+
+    a_dist = np.array([a["dist"] for a in anchors], dtype=float)
+
+    # ---------- helpers ----------
+    def _smoothstep(x):
+        x = np.clip(x, 0.0, 1.0)
+        return x*x*(3.0 - 2.0*x)
+
+    def _interp_time(df, t, col):
+        if df is None or len(df.index) == 0:
+            return None
+        if t < df.index[0] or t > df.index[-1]:
+            return None
+
+        if not do_tinterp:
+            v = df.loc[:t].iloc[-1][col]
+            return None if pd.isna(v) else float(v)
+
+        j = df.index.searchsorted(t)
+        if j == 0:
+            v = df.iloc[0][col]
+            return None if pd.isna(v) else float(v)
+        if j >= len(df.index):
+            v = df.iloc[-1][col]
+            return None if pd.isna(v) else float(v)
+
+        t1 = df.index[j-1]; t2 = df.index[j]
+        y1 = df.loc[t1, col]; y2 = df.loc[t2, col]
+
+        if pd.isna(y1) and pd.isna(y2):
+            return None
+        if pd.isna(y1):
+            return float(y2)
+        if pd.isna(y2):
+            return float(y1)
+
+        w = (t - t1) / (t2 - t1)
+        return float((1-w)*y1 + w*y2)
+
+    def _fallback_values():
+        temp = AMBIENT_TEMP_C
+        pres = AMBIENT_PRES_HPA
+        rhum = AMBIENT_RHUM_PCT
+        rho  = AMBIENT_RHO
+        tsun = 0.0
         if use_wind_data:
-            required += ['wspd', 'wdir']
+            wspd = 0.0
+            wdir = 0.0
+        else:
+            wspd = AMBIENT_WIND_SPEED_MS
+            wdir = AMBIENT_WIND_DIR_DEG
+        return temp, pres, rhum, rho, wspd, wdir, tsun
 
-        for col in required:
-            if col not in df.columns:
-                raise ValueError(f"Meteostat data missing column '{col}'")
+    # ---------- outputs ----------
+    out_temp = np.empty(n, float)
+    out_pres = np.empty(n, float)
+    out_rhum = np.empty(n, float)
+    out_rho  = np.empty(n, float)
+    out_wspd = np.empty(n, float)
+    out_wdir = np.empty(n, float)
+    out_tsun = np.empty(n, float)
 
-        for col in required:
-            df[col] = df[col].ffill().bfill()
+    for k, t in enumerate(idx):
+        d = dist_m[k]
+        j = np.searchsorted(a_dist, d)
+        j0 = max(0, j - 1)
+        j1 = min(len(anchors) - 1, j)
 
-        # Density always derived from thermodynamic state
-        df['rho'] = air_density_from_meteostat(
-            df['temp'], df['pres'], df['rhum']
-        )
+        A0 = anchors[j0]
+        A1 = anchors[j1]
+        df0 = A0["df"]
+        df1 = A1["df"]
 
-        df.index = pd.to_datetime(df.index)
+        # if blending disabled or anchors identical or both invalid -> use single anchor
+        if (not do_blend) or (j0 == j1) or (a_dist[j1] == a_dist[j0]) or (df0 is None and df1 is None):
+            dfA = df0 if df0 is not None else df1
 
-        wspd_ms   = []
-        wdir_deg  = []
-        temp_c    = []
-        pres_hpa  = []
-        rhum_pct  = []
-        rho       = []
+            temp = _interp_time(dfA, t, 'temp')
+            pres = _interp_time(dfA, t, 'pres')
+            rhum = _interp_time(dfA, t, 'rhum')
+            rho  = _interp_time(dfA, t, 'rho')
+            tsun = _interp_time(dfA, t, 'tsun')
 
-        for t in idx:
-            if t < df.index[0] or t > df.index[-1]:
-                # Outside Meteostat coverage
-                temp_c.append(15.0)
-                pres_hpa.append(1013.0)
-                rhum_pct.append(50.0)
-                rho.append(1.225)
-
-                if use_wind_data:
-                    wspd_ms.append(0.0)
-                    wdir_deg.append(0.0)
-                else:
-                    wspd_ms.append(AMBIENT_WIND_SPEED_MS)
-                    wdir_deg.append(AMBIENT_WIND_DIR_DEG)
+            # If core state missing -> full fallback
+            if (temp is None) or (pres is None) or (rhum is None) or (rho is None):
+                temp, pres, rhum, rho, wspd, wdir, tsun_f = _fallback_values()
+                tsun = tsun_f
             else:
-                row = df.loc[:t].iloc[-1]
-
-                temp_c.append(row['temp'])
-                pres_hpa.append(row['pres'])
-                rhum_pct.append(row['rhum'])
-                rho.append(row['rho'])
-
+                if tsun is None:
+                    tsun = 0.0
                 if use_wind_data:
-                    wspd_ms.append(row['wspd'] / 3.6)  # km/h → m/s
-                    wdir_deg.append(row['wdir'])
+                    wspd = _interp_time(dfA, t, 'wspd')
+                    wdir = _interp_time(dfA, t, 'wdir')
+                    if wspd is None: wspd = 0.0
+                    if wdir is None: wdir = 0.0
+                    wspd = float(wspd) / 3.6
+                    wdir = float(wdir)
                 else:
-                    wspd_ms.append(AMBIENT_WIND_SPEED_MS)
-                    wdir_deg.append(AMBIENT_WIND_DIR_DEG)
+                    wspd = AMBIENT_WIND_SPEED_MS
+                    wdir = AMBIENT_WIND_DIR_DEG
 
-        return {
-            "wspd_ms":  np.array(wspd_ms),
-            "wdir_deg": np.array(wdir_deg),
-            "temp_c":   np.array(temp_c),
-            "pres_hpa": np.array(pres_hpa),
-            "rhum_pct": np.array(rhum_pct),
-            "rho":      np.array(rho),
-        }
+        else:
+            # fixed-distance crossfade centered between anchors
+            d0 = a_dist[j0]
+            d1 = a_dist[j1]
+            dmid = 0.5*(d0 + d1)
 
-    except Exception as e:
-        print(f"Warning: failed to fetch Meteostat data ({e}). Using defaults.")
-        n = len(times)
-        return {
-            "wspd_ms":  np.full(n, AMBIENT_WIND_SPEED_MS),
-            "wdir_deg": np.full(n, AMBIENT_WIND_DIR_DEG),
-            "temp_c":   np.full(n, 20.0),
-            "pres_hpa": np.full(n, 1013.0),
-            "rhum_pct": np.full(n, 50.0),
-            "rho":      np.full(n, 1.225),
-        }
+            L = min(crossfade_m, max(1.0, d1 - d0))
+            x = (d - (dmid - 0.5*L)) / L
+            w = _smoothstep(x)
+
+            def _blend(col, fallback):
+                v0 = _interp_time(df0, t, col)
+                v1 = _interp_time(df1, t, col)
+                if v0 is None and v1 is None:
+                    return fallback
+                if v0 is None:
+                    return float(v1)
+                if v1 is None:
+                    return float(v0)
+                return float((1.0 - w) * v0 + w * v1)
+
+            temp = _blend('temp', AMBIENT_TEMP_C)
+            pres = _blend('pres', AMBIENT_PRES_HPA)
+            rhum = _blend('rhum', AMBIENT_RHUM_PCT)
+            rho  = _blend('rho',  AMBIENT_RHO)
+            tsun = _blend('tsun', 0.0)
+
+            if use_wind_data:
+                wspd = _blend('wspd', 0.0) / 3.6
+                wdir = _blend('wdir', 0.0)
+            else:
+                wspd = AMBIENT_WIND_SPEED_MS
+                wdir = AMBIENT_WIND_DIR_DEG
+
+        out_temp[k] = temp
+        out_pres[k] = pres
+        out_rhum[k] = rhum
+        out_rho[k]  = rho
+        out_wspd[k] = wspd
+        out_wdir[k] = wdir
+        out_tsun[k] = tsun
+
+    return {
+        "wspd_ms":  out_wspd,
+        "wdir_deg": out_wdir,
+        "temp_c":   out_temp,
+        "pres_hpa": out_pres,
+        "rhum_pct": out_rhum,
+        "rho":      out_rho,
+        "tsun_min": out_tsun,
+    }
 
 
 def build_gear_list(cfg):
@@ -943,7 +1209,7 @@ def manage_front_gear(current_front, current_rear, wheel_rpm, front_teeth_list, 
             return front_teeth_list[front_idx + 1]
     return current_front
 
-def interp_with_gap_zero(new_t, t, y, gap_s=10.0, fill_value=0.0):
+def interp_with_gap_zero(new_t, t, dists, y, gap_s=10.0, fill_value=0.0):
     """
     Interpolate y(t) onto new_t, but if new_t falls inside a gap in t larger than gap_s,
     force output to fill_value (e.g. 0 for speed during autopause gaps).
@@ -978,8 +1244,80 @@ def interp_with_gap_zero(new_t, t, y, gap_s=10.0, fill_value=0.0):
 
     return yi
 
-# usage
-# speeds_interp = interp_with_gap_zero(new_timestamps, timestamps, speeds, gap_s=8.0, fill_value=0.0)
+def interp_with_gap_dist_fallback(new_t, t, dists, y, gap_s=10.0, fill_value=0.0,
+                                  clamp_nonneg=True):
+    """
+    Interpolate y(t) onto new_t.
+
+    If new_t falls inside a sampling gap in t larger than gap_s, replace output with
+    a distance-based average speed over that gap: (dists[i+1]-dists[i])/(t[i+1]-t[i]).
+
+    Parameters
+    ----------
+    new_t : array
+        Target timestamps (seconds).
+    t : array
+        Original timestamps (seconds).
+    dists : array
+        Cumulative distance at original timestamps (meters, or any distance unit).
+    y : array
+        Original y(t) values (e.g., speed).
+    gap_s : float
+        Gap threshold in seconds.
+    fill_value : float
+        Used if distance data is unusable for a gap (NaN, dt<=0, etc.).
+    clamp_nonneg : bool
+        If True, negative fallback speeds are clamped to 0 (useful for noisy dists).
+
+    Returns
+    -------
+    yi : array
+        Interpolated values with gap fallback applied.
+    """
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    dists = np.asarray(dists, dtype=float)
+    new_t = np.asarray(new_t, dtype=float)
+
+    # Sort by time
+    order = np.argsort(t)
+    t = t[order]
+    y = y[order]
+    dists = dists[order]
+
+    # Normal interpolation (np.interp clamps outside bounds to edge values)
+    yi = np.interp(new_t, t, y)
+
+    # Identify large gaps
+    dt = np.diff(t)
+    gap_idx = np.where(dt > gap_s)[0]  # gap between t[i] and t[i+1]
+    if gap_idx.size == 0:
+        return yi
+
+    # Apply distance-based average speed inside each gap
+    for i in gap_idx:
+        t0, t1 = t[i], t[i + 1]
+        mask = (new_t > t0) & (new_t < t1)
+        if not np.any(mask):
+            continue
+
+        d0, d1 = dists[i], dists[i + 1]
+        denom = (t1 - t0)
+
+        # Validate
+        if denom <= 0 or not np.isfinite(d0) or not np.isfinite(d1):
+            v_gap = fill_value
+        else:
+            v_gap = (d1 - d0) / denom
+            if not np.isfinite(v_gap):
+                v_gap = fill_value
+            elif clamp_nonneg and v_gap < 0:
+                v_gap = 0.0
+
+        yi[mask] = v_gap
+
+    return yi
+
 
 def compute_power(speed, acc, grade, wind_speed, cfg: RiderBikeConfig, rho_air, slope_type):
     """
@@ -991,7 +1329,6 @@ def compute_power(speed, acc, grade, wind_speed, cfg: RiderBikeConfig, rho_air, 
     slope_angle = math.atan(grade)
     v_rel = speed + wind_speed
 
-    high_speed_draft_factor = DROPS_DRAG_REDUCTION if speed * 3.6 >= cfg.high_speed_aero_threshold_kmh else 0.0
     if slope_type == "climb":
         local_draft_factor = cfg.draft_effect_uh
     elif slope_type == "downhill":
@@ -999,7 +1336,7 @@ def compute_power(speed, acc, grade, wind_speed, cfg: RiderBikeConfig, rho_air, 
     else:
         local_draft_factor = cfg.draft_effect
 
-    high_speed_draft_factor = DROPS_DRAG_REDUCTION if speed * 3.6 >= cfg.high_speed_aero_threshold_kmh else 0.0
+    high_speed_draft_factor = DROPS_DRAG_REDUCTION if v_rel * 3.6 >= cfg.high_speed_aero_threshold_kmh else 0.0
     local_draft_factor *= (1.0 - high_speed_draft_factor)
 
     wheel_radius_m = cfg.wheel_circumference / 2. / np.pi
@@ -1033,20 +1370,20 @@ HYDRATION_MODEL_MODE = "iso"   # "iso" or "sport"
 HYDRATION_PARAMS_ISO = {
     # Metabolic / body
     "efficiency": EFFICIENCY,         # mech -> metabolic
-    "basal_W": 80.0,            # basic heat production [W]
-    "body_height_m": 1.80,      # default height for DuBois area
+    "basal_W": 80.0,                  # basic heat production [W]
+    "body_height_m": 1.80,            # default height for DuBois area
 
     # ISO-style limits (DIN EN ISO 7933)
-    "swmax_W_m2_acclim": 500.0,  # acclimatized
+    "swmax_W_m2_acclim": 500.0,       # acclimatized
     "swmax_W_m2_nonacclim": 400.0,
-    "dmax_frac_with_water": 0.05,  # 5 % of body mass
-    "dmax_frac_no_water": 0.03,    # 3 %
+    "dmax_frac_with_water": 0.05,     # 5 % of body mass
+    "dmax_frac_no_water": 0.03,       # 3 %
 
     # Shape of the empirical sweating relation
     # base_lph = a + b * max(M - Met_ref, 0)
-    "a_lph": 0.20,              # base sweating at low workload
-    "b_lph_per_Wm2": 0.0025,    # slope vs. M [W/m²]
-    "Met_ref_Wm2": 80.0,        # reference metabolic rate
+    "a_lph": 0.20,                    # base sweating at low workload
+    "b_lph_per_Wm2": 0.0025,          # slope vs. M [W/m²]
+    "Met_ref_Wm2": 80.0,              # reference metabolic rate
 
     # Temperature factor: 1 + k_T * max(T - T_ref, 0)
     "T_ref_C": 20.0,
@@ -1063,6 +1400,18 @@ HYDRATION_PARAMS_ISO = {
     "air_factor_min": 0.5,
     "air_factor_max": 1.2,
 
+    # --------- NEW: Sun exposure influence (minutes per hour) ----------
+    # filtered_tsun is assumed to be "minutes of sun within the last hour" (0..60).
+    # We convert it to a fraction f_sun in [0..1] and scale sweat demand.
+    #
+    # Simple model: water_lph *= (1 + k_sun_lph * f_sun)
+    #
+    # PHS model: we approximate increased radiant load by bumping mean radiant
+    # temperature: Tr = Ta + dTr_C_full_sun * f_sun
+    "k_sun_lph": 0.25,                # +25% at full sun (tunable)
+    "dTr_C_full_sun": 10.0,           # full sun raises effective Tr by ~10°C (tunable)
+    # -------------------------------------------------------------------
+
     # Assume acclimatized worker by default
     "acclim": True,
 }
@@ -1072,7 +1421,7 @@ HYDRATION_PARAMS_SPORT = {
     **HYDRATION_PARAMS_ISO,
 
     # Sportler können typischerweise mehr schwitzen
-    "swmax_W_m2_acclim": 700.0,     # erlaubt höhere Spitzen
+    "swmax_W_m2_acclim": 700.0,
     "swmax_W_m2_nonacclim": 550.0,
 
     # Etwas aggressivere Steigung vs. M
@@ -1082,6 +1431,10 @@ HYDRATION_PARAMS_SPORT = {
     # Temperatur- und Feuchte-Sensitivität etwas höher
     "k_T": 0.06,
     "k_RH": 0.012,
+
+    # Optional: sport feels sun more (or less) – tune as you like
+    "k_sun_lph": 0.30,
+    "dTr_C_full_sun": 12.0,
 }
 
 # --- PHS / ISO 7933 helpers -----------------------------------------------
@@ -1094,6 +1447,7 @@ def _aggregate_to_minutes(times, **series):
     - Missing-minute samples are filled sensibly:
         * Environmental variables: last known value
         * Metabolic/work: filled with 0 (rest)
+        * Sun exposure (tsun_min_per_h): forward-filled (or 0 if never valid)
     """
 
     if len(times) == 0:
@@ -1107,10 +1461,8 @@ def _aggregate_to_minutes(times, **series):
 
     # Integer minute index
     minute_idx = np.floor_divide(tsec, 60).astype(int)
+    n_min = int(minute_idx.max()) + 1
 
-    n_min = int(minute_idx.max()) + 1  # covers entire ride duration
-
-    # Initialize output
     out = {"t_min": np.arange(n_min, dtype=float)}
 
     for name, arr in series.items():
@@ -1125,34 +1477,29 @@ def _aggregate_to_minutes(times, **series):
         # === FILLING RULES ========
 
         if name in ("Met_Wm2", "Work_Wm2"):
-            # Minutes without riding → at rest → 0
             aggregated = np.nan_to_num(aggregated, nan=0.0)
 
-        elif name in ("Ta_C", "RH_pct", "Va_ms"):
-            # Environmental variables → forward-fill them
+        elif name in ("Ta_C", "RH_pct", "Va_ms", "tsun_min_per_h"):
             valid = np.isfinite(aggregated)
             if not valid.any():
-                # If NEVER valid, just fill zeros to avoid NaNs
                 aggregated[:] = 0.0
             else:
-                # forward fill
                 for i in range(1, n_min):
                     if not np.isfinite(aggregated[i]):
-                        aggregated[i] = aggregated[i-1]
-
-                # if first minute is NaN, back-fill
+                        aggregated[i] = aggregated[i - 1]
                 if not np.isfinite(aggregated[0]):
-                    # take first finite value
-                    first_val = aggregated[np.isfinite(aggregated)][0]
-                    aggregated[0] = first_val
+                    aggregated[0] = aggregated[np.isfinite(aggregated)][0]
+
+            # clamp sun exposure to 0..60 if present
+            if name == "tsun_min_per_h":
+                aggregated = np.clip(aggregated, 0.0, 60.0)
 
         else:
-            # All other arrays → forward fill then backfill
             valid = np.isfinite(aggregated)
             if valid.any():
                 for i in range(1, n_min):
                     if not np.isfinite(aggregated[i]):
-                        aggregated[i] = aggregated[i-1]
+                        aggregated[i] = aggregated[i - 1]
                 if not np.isfinite(aggregated[0]):
                     aggregated[0] = aggregated[np.isfinite(aggregated)][0]
             else:
@@ -1208,6 +1555,8 @@ def _phs_compute(
     accl: bool = True,
     can_drink_freely: bool = True,
     clothing: PhsClothingParams | None = None,
+    tsun_min_per_h=None,
+    phs_params: dict | None = None,
 ):
     """
     Core PHS loop following ISO 7933 Annex A/E.
@@ -1225,8 +1574,21 @@ def _phs_compute(
     Work = np.asarray(Work_Wm2, dtype=float)
     n = len(t_min)
 
-    Adu, aux, SWmax, wmax, Dmax = _phs_person_params(body_mass_kg, height_m, accl, can_drink_freely)
+    if tsun_min_per_h is None:
+        tsun = np.zeros(n, dtype=float)
+    else:
+        tsun = np.asarray(tsun_min_per_h, dtype=float)
+        if tsun.size != n:
+            # best-effort: resize by clipping/repeating to match n
+            if tsun.size == 0:
+                tsun = np.zeros(n, dtype=float)
+            else:
+                tsun = np.interp(np.arange(n), np.linspace(0, n - 1, tsun.size), tsun)
+        tsun = np.clip(tsun, 0.0, 60.0)
 
+    dTr_full = float(phs_params.get("dTr_C_full_sun", 10.0))
+
+    Adu, aux, SWmax, wmax, Dmax = _phs_person_params(body_mass_kg, height_m, accl, can_drink_freely)
     # ---- clothing & geometry (mostly constant over time here) ----
     Icl = clothing.Icl_clo
     imst = clothing.imst
@@ -1296,7 +1658,11 @@ def _phs_compute(
     Dlimloss = 999.0
 
     # we approximate mean radiant temperature as air temperature
-    Tr = Ta.copy()
+    # --- CHANGED: add sun-based radiant temperature bump ---
+    # f_sun = 0..1, Tr = Ta + dTr_full * f_sun
+    f_sun = tsun / 60.0
+    Tr = Ta + dTr_full * f_sun
+
 
     for i in range(n):
         Ta_i = Ta[i]
@@ -1631,24 +1997,22 @@ def compute_phs_timeseries_from_filtered(filtered, cfg, mode: str = HYDRATION_MO
     Uses:
       filtered["filtered_times"]
       filtered["filtered_temp"] (°C)
+      filtered["filtered_tsun"] (min per hour, 0..60)   <-- NEW
       filtered["filtered_rhum"] (%)
       filtered["filtered_speeds_kph"]
       filtered["filtered_head_winds"] (m/s, signed)
       filtered["filtered_powers"] (W)
-
-    cfg: RiderBikeConfig (must have cfg.body_mass; height is taken from hydration params).
     """
     times = np.asarray(filtered["filtered_times"], dtype=object)
     temp_C = np.asarray(filtered["filtered_temp"], dtype=float)
+    tsun_min_per_h = np.asarray(filtered.get("filtered_tsun", np.zeros_like(temp_C)), dtype=float)  # NEW
     rhum_pct = np.asarray(filtered["filtered_rhum"], dtype=float)
     spd_kph = np.asarray(filtered["filtered_speeds_kph"], dtype=float)
     head_ms = np.asarray(filtered["filtered_head_winds"], dtype=float)
     pow_W = np.asarray(filtered["filtered_powers"], dtype=float)
 
-    # relative air speed (simplified): riding speed + headwind component
     v_rel_ms = np.maximum(0.0, spd_kph / 3.6 + head_ms)
 
-    # person parameters
     params = HYDRATION_PARAMS_ISO if mode == "iso" else HYDRATION_PARAMS_SPORT
     height_m = params.get("body_height_m", 1.80)
     eff = params.get("efficiency", EFFICIENCY)
@@ -1656,16 +2020,15 @@ def compute_phs_timeseries_from_filtered(filtered, cfg, mode: str = HYDRATION_MO
 
     Adu = _body_surface_area_du_bois(cfg.body_mass, height_m)
 
-    # per-sample metabolic and mechanical rates per m²
     P_pos = np.clip(pow_W, 0.0, None)
     metabolic_W = P_pos / eff + basal_W
     Met_Wm2 = metabolic_W / Adu
     Work_Wm2 = P_pos / Adu
 
-    # aggregate to 1-min bins
     agg = _aggregate_to_minutes(
         times,
         Ta_C=temp_C,
+        tsun_min_per_h=tsun_min_per_h,   # NEW
         RH_pct=rhum_pct,
         Va_ms=v_rel_ms,
         Met_Wm2=Met_Wm2,
@@ -1685,12 +2048,11 @@ def compute_phs_timeseries_from_filtered(filtered, cfg, mode: str = HYDRATION_MO
         height_m=height_m,
         accl=accl,
         can_drink_freely=can_drink_freely,
+        tsun_min_per_h=agg["tsun_min_per_h"],   # NEW
+        phs_params=params,                      # NEW
     )
 
-    # derive a sweat *volume* rate [L/h] from SWp_Wm2
-    # 1 W/m² -> 1.47 g/(m²·h); Adri ~ Adu m² -> grams/h -> L/h
     SWp_L_per_h = phs["SWp_Wm2"] * 1.47 * phs["Adu_m2"] / 1000.0
-
     phs["SWp_L_per_h"] = SWp_L_per_h
     return phs
 
@@ -1735,8 +2097,24 @@ def _resample_phs_to_filtered(phs, filtered_times):
     return out
 
 
+def max_allowed_water_loss_l(
+    body_mass_kg: float,
+    mode: str = HYDRATION_MODEL_MODE,
+    can_drink_freely: bool = True,
+) -> float:
+    """
+    Dmax gemäß DIN:
+    - 5 % Körpermasse mit Wasser
+    - 3 % ohne Wasser
+    (Sport-Modell nutzt gleiche Logik, aber du kannst die Fraktionen in den Parametern ändern.)
+    """
+    params = HYDRATION_PARAMS_ISO if mode == "iso" else HYDRATION_PARAMS_SPORT
+    frac = params["dmax_frac_with_water"] if can_drink_freely else params["dmax_frac_no_water"]
+    return body_mass_kg * frac  # [kg ≈ L]
+
 def estimate_water_loss_rate_lph(
     temp_c: float,
+    tsun_min_per_h: float,          # NEW
     rh_percent: float,
     avg_speed_ms: float,
     avg_headwind_ms: float,
@@ -1748,8 +2126,8 @@ def estimate_water_loss_rate_lph(
     """
     ISO- oder Sport-Variante der Schweißrate [L/h].
 
-    mode: "iso" -> streng an ISO-Grenzen (SWmax, Dmax) angelehnt
-          "sport" -> sportangepasste Parameter
+    NEW:
+      tsun_min_per_h = sun exposure in minutes per hour (0..60).
     """
     params = HYDRATION_PARAMS_ISO if mode == "iso" else HYDRATION_PARAMS_SPORT
 
@@ -1777,47 +2155,30 @@ def estimate_water_loss_rate_lph(
     k_air = params["k_air"]
     v_air = max(avg_speed_ms + avg_headwind_ms, 0.0)
     air_factor = 1.0 - k_air * max(v_air - v_ref, 0.0)
-    air_factor = np.clip(
-        air_factor,
-        params["air_factor_min"],
-        params["air_factor_max"],
-    )
+    air_factor = np.clip(air_factor, params["air_factor_min"], params["air_factor_max"])
 
-    water_lph = base_lph * temp_factor * hum_factor * air_factor
+    # --- NEW: sun factor ---
+    tsun = float(np.clip(tsun_min_per_h, 0.0, 60.0))
+    f_sun = tsun / 60.0
+    k_sun = float(params.get("k_sun_lph", 0.25))
+    sun_factor = 1.0 + k_sun * f_sun
+
+    water_lph = base_lph * temp_factor * hum_factor * air_factor * sun_factor
 
     # 4) SWmax aus DIN: maximale Schweißrate
     acclim = params.get("acclim", True)
     SWmax_Wm2 = params["swmax_W_m2_acclim"] if acclim else params["swmax_W_m2_nonacclim"]
 
-    # 1 W/m² -> 1.47 g/(m²·h); total g/h -> L/h
     grams_per_hour = SWmax_Wm2 * 1.47 * adu
     SWmax_lph = grams_per_hour / 1000.0
 
     water_lph = float(np.clip(water_lph, 0.0, SWmax_lph))
-
-    # optional: Dmax (max. totaler Verlust) kannst du später mit der Zeitreihe checken
-
     return water_lph
-
-
-def max_allowed_water_loss_l(
-    body_mass_kg: float,
-    mode: str = HYDRATION_MODEL_MODE,
-    can_drink_freely: bool = True,
-) -> float:
-    """
-    Dmax gemäß DIN:
-    - 5 % Körpermasse mit Wasser
-    - 3 % ohne Wasser
-    (Sport-Modell nutzt gleiche Logik, aber du kannst die Fraktionen in den Parametern ändern.)
-    """
-    params = HYDRATION_PARAMS_ISO if mode == "iso" else HYDRATION_PARAMS_SPORT
-    frac = params["dmax_frac_with_water"] if can_drink_freely else params["dmax_frac_no_water"]
-    return body_mass_kg * frac  # [kg ≈ L]
 
 
 def compute_water_loss_timeseries(
     filtered_temp_c,
+    filtered_tsun_min_per_h,         # NEW
     filtered_rhum_pct,
     filtered_speeds_kph,
     filtered_headwind_ms,
@@ -1830,6 +2191,9 @@ def compute_water_loss_timeseries(
     """
     Zeitreihe der Schweißrate [L/h] und kumulativen Wasserverluste [L].
 
+    NEW:
+      filtered_tsun_min_per_h: per-sample sun exposure in minutes per hour (0..60)
+
     Rückgabe:
         water_rate_L_per_h : np.ndarray (len N)
         cum_water_loss_L   : np.ndarray (len N)
@@ -1840,11 +2204,15 @@ def compute_water_loss_timeseries(
         return np.array([]), np.array([]), 0.0
 
     temp_c = np.asarray(filtered_temp_c, dtype=float)
+    tsun = np.asarray(filtered_tsun_min_per_h, dtype=float)   # NEW
     rh = np.asarray(filtered_rhum_pct, dtype=float)
     spd_kph = np.asarray(filtered_speeds_kph, dtype=float)
     headwind = np.asarray(filtered_headwind_ms, dtype=float)
-    power = np.asarray(np.clip(filtered_powers_w,0.0,None), dtype=float)
+    power = np.asarray(np.clip(filtered_powers_w, 0.0, None), dtype=float)
     spd_ms = spd_kph / 3.6
+
+    # clamp sun to [0..60]
+    tsun = np.clip(tsun, 0.0, 60.0)
 
     # dt [s] pro Sample
     tsec = np.array([t.timestamp() for t in filtered_times], dtype=float)
@@ -1858,12 +2226,14 @@ def compute_water_loss_timeseries(
     water_rate = np.empty(n, dtype=float)
 
     for i in range(n):
-        if dt[i] > 30.:
-            pwr = 0
+        if dt[i] > 30.0:
+            pwr = 0.0
         else:
             pwr = power[i]
+
         water_rate[i] = estimate_water_loss_rate_lph(
             temp_c=temp_c[i],
+            tsun_min_per_h=tsun[i],        # NEW
             rh_percent=rh[i],
             avg_speed_ms=spd_ms[i],
             avg_headwind_ms=headwind[i],
@@ -1873,15 +2243,10 @@ def compute_water_loss_timeseries(
             can_drink_freely=can_drink_freely,
         )
 
-    # [L/h] -> [L] pro Step
     step_loss_L = water_rate * dt / 3600.0
     cum_water_L = np.cumsum(step_loss_L)
 
     dmax_L = max_allowed_water_loss_l(body_mass_kg, mode=mode, can_drink_freely=can_drink_freely)
-
-    # Optional: harte Begrenzung
-    # cum_water_L = np.minimum(cum_water_L, dmax_L)
-
     return water_rate, cum_water_L, dmax_L
 
 
@@ -2122,11 +2487,11 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
         new_times = [start_time + timedelta(seconds=i) for i in range(total_seconds + 1)]
         timestamps = np.array([t.timestamp() for t in times])
         new_timestamps = np.array([t.timestamp() for t in new_times])
-
+        
         lats = np.interp(new_timestamps, timestamps, lats)
         lons = np.interp(new_timestamps, timestamps, lons)
         raw_alts = np.interp(new_timestamps, timestamps, raw_alts)
-        speeds = interp_with_gap_zero(new_timestamps, timestamps, speeds, gap_s=240.0, fill_value=0.0)
+        speeds = interp_with_gap_dist_fallback(new_timestamps, timestamps, dists, speeds, gap_s=10.0, fill_value=0.0)
         dspeed = np.diff(speeds)
         bearings_degs = np.interp(new_timestamps, timestamps, bearings_degs)
         for i in range(2,len(speeds)-2):
@@ -2959,7 +3324,7 @@ def _headwind_and_power(core, smooth, slope_type_series, weather, cfg, progress_
     headwinds = [headwinds[0]] + headwinds
     accelerations = [0] + accelerations
 
-    smoothed_headwinds = moving_average(headwinds, window_size=SMOOTHING_WINDOW_SIZE_S)
+    smoothed_headwinds = moving_average(headwinds, window_size=SMOOTHING_WINDOW_SIZE_S*3)
 
     # =========================
     # SIMULATE NEW TIMESTAMPS
@@ -3215,6 +3580,7 @@ def _filter_and_disk_temp(core, smooth, slope_type_series, corner_type_series, p
     pres_series = weather["pres_hpa"]
     rhum_series = weather["rhum_pct"]
     wind_series = weather["wspd_ms"]
+    tsun_series = weather["tsun_min"]
     wind_dir_series = weather["wdir_deg"]
 
     grades_array = np.array(moving_average(grades, window_size=1))
@@ -3295,6 +3661,7 @@ def _filter_and_disk_temp(core, smooth, slope_type_series, corner_type_series, p
         "filtered_rhum": np.array(rhum_series)[idx],
         "filtered_wind_dirs": np.array(wind_dir_series)[idx],
         "filtered_global_winds": np.array(wind_series)[idx],
+        "filtered_tsun": np.array(tsun_series)[idx],
         "total_distance_km": total_distance_km,
         "elevation_gain_m": elevation_gain_m,
         "filtered_slope_type": slope_type_series[idx],
@@ -3324,6 +3691,44 @@ def _filter_device_sensors(core, valid_mask):
         return_dict["filtered_temp_device_c"] = None
     
     return return_dict
+
+def _compute_normalized_power(filtered, filtered_sensors=None, timestep_min=None):
+    """Compute Normalized Power (NP) from filtered power data."""
+    fp = np.clip(np.array(filtered["filtered_powers"], dtype=float), 0.0, None)
+    pwr_meas = filtered_sensors.get("filtered_power_meas_w") if filtered_sensors is not None else None
+
+    window_size = int(round(30.0 / (timestep_min * 60.0)))
+    if window_size < 1:
+        window_size = 1
+
+    #calc rolling average power from calculated power
+    rolling_avg_pwr_calc = 0.
+    if len(fp) >= window_size:
+        cumsum = np.cumsum(np.insert(fp, 0, 0)) 
+        rolling_avg_pwr_calc = (cumsum[window_size:] - cumsum[:-window_size]) / float(window_size)
+    else:
+        rolling_avg_pwr_calc = np.array([np.mean(fp)] * len(fp))
+    rolling_avg_powers_cp = np.clip(rolling_avg_pwr_calc, 0.0, None)
+    fourth_power = rolling_avg_powers_cp ** 4.0
+    mean_fourth_power = np.mean(fourth_power)
+    normalized_power_calculated = mean_fourth_power ** 0.25
+
+    # calc rolling average power from measured power if available
+    normalized_power_measured = 0.0
+    if pwr_meas is not None and len(pwr_meas) == len(fp):
+        rolling_avg_pwr_meas = 0.
+        if len(pwr_meas) >= window_size:
+            cumsum_m = np.cumsum(np.insert(pwr_meas, 0, 0)) 
+            rolling_avg_pwr_meas = (cumsum_m[window_size:] - cumsum_m[:-window_size]) / float(window_size)
+        else:
+            rolling_avg_pwr_meas = np.array([np.mean(pwr_meas)] * len(pwr_meas))
+        rolling_avg_powers_pm = np.clip(rolling_avg_pwr_meas, 0.0, None)
+        fourth_power_m = rolling_avg_powers_pm ** 4.0
+        mean_fourth_power_m = np.mean(fourth_power_m)
+        normalized_power_measured = mean_fourth_power_m ** 0.25
+
+    return normalized_power_calculated, normalized_power_measured
+
 
 def _compute_kcal_timeseries(filtered_times, filtered_powers, timestep_min, cfg):
     """Compute cumulative kcal from active power and base metabolism."""
@@ -3367,7 +3772,7 @@ def _detect_breaks(smoothed_speeds_kph, times, total_dists, timestep_min, break_
     - simulate=False: use speed threshold (legacy logic).
     - simulate=True: detect breaks from time gaps (robust for simulated breaks).
     """
-    MIN_BREAK_DURATION_MIN = 0.5
+    MIN_BREAK_DURATION_MIN = 1.0  # minimum break duration to consider
     breaks = []
 
     n = min(len(times), len(total_dists), len(smoothed_speeds_kph))
@@ -3953,7 +4358,9 @@ def _augment_climb_metrics(climb_list, filtered_dists, filtered_powers, timestep
         eps = 1e-6
         mask = (d >= d0 - eps) & (d <= d1 + eps)
         n_steps = int(np.count_nonzero(mask))
-        duration_min = n_steps * timestep_min
+        t0_min    = float(c.get("start_time"))
+        t1_min    = float(c.get("end_time"))
+        duration_min = t1_min - t0_min
 
         if n_steps > 0:
             p_seg = p[mask]
@@ -3971,7 +4378,7 @@ def _augment_climb_metrics(climb_list, filtered_dists, filtered_powers, timestep
 
         elev_gain = float(c.get("elevation_gain_m", 0.0))
         hours = duration_min / 60.0
-        vam = elev_gain / hours if hours > 0 else 0.0
+        vam = elev_gain / hours if hours > 0. else 0.0
 
         c["duration_min"] = duration_min
         c["avg_power_w"] = avg_p
@@ -4302,11 +4709,16 @@ def analyze_gpx_file(
     start_time = core["start_time"]
     end_time = core["end_time"]
 
+
     # 5) Filter & brake temps
     filtered = _filter_and_disk_temp(core, smooth, slope_type_series, corner_type_series, power_data, weather, progress_cb=_report)
 
+
     # 6) Device-based sensors filtered
     filtered_sensors = _filter_device_sensors(core, filtered["valid"])
+
+    # 6.1) Normalized power
+    norm_pwr_w_calc, norm_pwr_w_meas = _compute_normalized_power(filtered, filtered_sensors=filtered_sensors, timestep_min=timestep_min)
 
     # 7) Kcal time series
     kcal_data = _compute_kcal_timeseries(
@@ -4319,6 +4731,7 @@ def analyze_gpx_file(
     #7.1 Water loss / sweating
     water_rate_L_per_h, cum_water_loss_L, dmax_L = compute_water_loss_timeseries(
         filtered_temp_c=filtered["filtered_temp"],
+        filtered_tsun_min_per_h=filtered["filtered_tsun"],
         filtered_rhum_pct=filtered["filtered_rhum"],
         filtered_speeds_kph=filtered["filtered_speeds_kph"],
         filtered_headwind_ms=filtered["filtered_head_winds"],
@@ -4385,20 +4798,26 @@ def analyze_gpx_file(
 
     # climb summary metrics
     max_vam = 0.0
+    avg_vam = 0.0
     avg_climb_power = 0.0
-    if combined_climbs:
-        vams = [c.get("vam_m_per_h", 0.0) for c in combined_climbs]
+    climbs_to_evaluate = combined_climbs if combined_climbs else climbs
+    if climbs_to_evaluate:
+        vams = [c.get("vam_m_per_h", 0.0) for c in climbs_to_evaluate]
         max_vam = float(max(vams)) if vams else 0.0
         weighted_list = []
-        for c in combined_climbs:
+        for c in climbs_to_evaluate:
+            e = c.get("elevation_gain_m", 0.0)
             p = c.get("avg_power_w", 0.0)
             w = c.get("duration_min", 0.0)
             if w > 0:
-                weighted_list.append((p, w))
+                weighted_list.append((p, w, e))
         if weighted_list:
-            num = sum(p * w for p, w in weighted_list)
-            den = sum(w for _, w in weighted_list)
+            eum = sum(e for _, _, e in weighted_list)
+            num = sum(p * w for p, w, _ in weighted_list)
+            den = sum(w for _, w, _ in weighted_list)
             avg_climb_power = float(num / den) if den > 0 else 0.0
+            avg_vam = float(eum / (den/60.)) if den > 0 else 0.0
+            
 
 
     # 10) Segments 5 km
@@ -4509,6 +4928,10 @@ def analyze_gpx_file(
           f"total {long_break_total_min:.1f} min")
 
     print("\n=== Climb Statistics ===")
+    print(f"Max VAM: {max_vam:.0f} m/h")
+    print(f"Avg VAM: {avg_vam:.0f} m/h")
+    print(f"Avg Climb Power: {avg_climb_power:.0f} W")
+
     print(f"Detected climbs: {len(climbs)}")
     for i, climb in enumerate(climbs):
         print(f" Climb {i+1}: {climb['distance_km']:.2f} km, "
@@ -4516,6 +4939,7 @@ def analyze_gpx_file(
               f"avg grade {climb['average_grade_pct']:.1f} %, "
               f"VAM {climb.get('vam_m_per_h', 0.0):.0f} m/h, "
               f"P_avg {climb.get('avg_power_w', 0.0):.0f} W, "
+              f"duration {climb['duration_min']:.1f} min, "
               f"from {time_to_readable(t_minutes=climb['start_time'])} to {time_to_readable(t_minutes=climb['end_time'])}, "
               f"distance {climb['start_distance_km']:.2f} km to {climb['end_distance_km']:.2f} km")
     print("\n=== Climb Combination ===")
@@ -4525,10 +4949,12 @@ def analyze_gpx_file(
               f"avg grade {climb['average_grade_pct']:.1f} %, "
               f"VAM {climb.get('vam_m_per_h', 0.0):.0f} m/h, "
               f"P_avg {climb.get('avg_power_w', 0.0):.0f} W, "
+              f"duration {climb['duration_min']:.1f} min, "
               f"from {time_to_readable(t_minutes=climb['start_time'])} to {time_to_readable(t_minutes=climb['end_time'])}, "
               f"distance {climb['start_distance_km']:.2f} km to {climb['end_distance_km']:.2f} km")
         
     print("\n=== Downhill Statistics ===")
+
     print(f"Detected Downhills: {len(downhills)}")
     for i, climb in enumerate(downhills):
         print(f" Downhill {i+1}: {climb['distance_km']:.2f} km, "
@@ -4536,6 +4962,7 @@ def analyze_gpx_file(
               f"avg grade {climb['average_grade_pct']:.1f} %, "
               f"VAM {climb.get('vam_m_per_h', 0.0):.0f} m/h, "
               f"P_avg {climb.get('avg_power_w', 0.0):.0f} W, "
+              f"duration {climb['duration_min']:.1f} min, "
               f"from {time_to_readable(t_minutes=climb['start_time'])} to {time_to_readable(t_minutes=climb['end_time'])}, "
               f"distance {climb['start_distance_km']:.2f} km to {climb['end_distance_km']:.2f} km")
     print("\n=== Downhill Combination ===")
@@ -4545,6 +4972,7 @@ def analyze_gpx_file(
               f"avg grade {climb['average_grade_pct']:.1f} %, "
               f"VAM {climb.get('vam_m_per_h', 0.0):.0f} m/h, "
               f"P_avg {climb.get('avg_power_w', 0.0):.0f} W, "
+              f"duration {climb['duration_min']:.1f} min, "
               f"from {time_to_readable(t_minutes=climb['start_time'])} to {time_to_readable(t_minutes=climb['end_time'])}, "
               f"distance {climb['start_distance_km']:.2f} km to {climb['end_distance_km']:.2f} km")
 
@@ -4559,6 +4987,8 @@ def analyze_gpx_file(
 
     if filtered_sensors["filtered_power_meas_w"].size > 0 and np.any(np.isfinite(filtered_sensors["filtered_power_meas_w"])):
         avg_pow_meas = float(np.nanmean(np.clip(filtered_sensors["filtered_power_meas_w"], 0, None)))
+        # remove all 0 entries for pedaling power average
+        avg_pow_meas_ped = float(np.nanmean(filtered_sensors["filtered_power_meas_w"][filtered_sensors["filtered_power_meas_w"] > 0]))
         print(f"\n=== Measured Power (powermeter) ===")
         print(f"Avg measured pedaling power: {avg_pow_meas:.1f} W (non-negative samples)")
 
@@ -4578,6 +5008,8 @@ def analyze_gpx_file(
         # device channels
         "corners": core["corners"],
         **filtered_sensors,
+        "avg_pow_meas_w": avg_pow_meas if 'avg_pow_meas' in locals() else None,
+        "avg_pow_meas_w_ped": avg_pow_meas_ped if 'avg_pow_meas_ped' in locals() else None,
         # gears
         "selected_front_teeth": gear_sim["selected_front_teeth"],
         "selected_rear_teeth": gear_sim["selected_rear_teeth"],
@@ -4603,6 +5035,10 @@ def analyze_gpx_file(
         "avg_power_with_freewheeling": avg_power_with_freewheeling,
         "kcal_burned": kcal_burned,
         "met_active": met_active,
+        "norm_pwr_w_calc": norm_pwr_w_calc,
+        "norm_pwr_w_meas": norm_pwr_w_meas,
+        "var_ind_calc": (norm_pwr_w_calc) / (avg_power_with_freewheeling) if avg_power_with_freewheeling > 0 else 0.0,
+        "var_ind_meas": (norm_pwr_w_meas) / (avg_pow_meas) if 'avg_pow_meas' in locals() else None,
         # breaks
         "breaks": breaks,
         "short_break_count": len(short_breaks),
@@ -4617,6 +5053,7 @@ def analyze_gpx_file(
         "combined_downhills": combined_downhills,
         "segments_5km": segments_5km,
         "max_climb_vam_m_per_h": max_vam,
+        "avg_climb_vam_m_per_h": avg_vam,
         "avg_climb_power_w": avg_climb_power,
         "best_segment_5km_power_w": best_seg_power_5km,
         # metadata
@@ -4628,6 +5065,8 @@ def analyze_gpx_file(
         "target_cadence": target_cadence,
         "use_ambient_data": use_ambient_data,
         "use_wind_data": use_wind_data,
+        "avg_speed_kph": float(np.mean(speeds_kph)) if speeds_kph.size > 0 else 0.0,
+        "max_speed_kph": float(np.max(speeds_kph)) if speeds_kph.size > 0 else 0.0,
         # kcal timeseries
         "cum_kcal_active": kcal_data["cum_kcal_active"],
         "cum_kcal_base": kcal_data["cum_kcal_base"],
@@ -5095,7 +5534,7 @@ def plot_profiles(result, highlight_climbs=False):
     fig.add_trace(go.Scatter(x=d, y=grd, name="Grade [%]"), row=1, col=1, secondary_y=True)
 
     fig.add_trace(go.Scatter(x=d, y=spd, name="Speed [km/h]"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=d, y=pwr, name="Power [W]"), row=3, col=1)
+    # fig.add_trace(go.Scatter(x=d, y=pwr, name="Power [W]"), row=3, col=1)
     fig.add_trace(go.Scatter(x=d, y=lp_pwr, name="Power (lowpass) [W]"), row=3, col=1)
     # add sensor power as dashed line
     fig.add_trace(go.Scatter(x=d, y=pwr_sens, name="Power (measured) [W]", line=dict(dash="dash")), row=3, col=1)
@@ -5542,12 +5981,18 @@ def plot_environment(result):
     temp = _arr(result.get("filtered_temp"))
     pres = _arr(result.get("filtered_pres"))
     rhum = _arr(result.get("filtered_rhum"))
+    tsun = _arr(result.get("filtered_tsun", np.zeros_like(d)))
 
-    d, ws, wd, rho, temp, pres, rhum = _clip_same_len(d, ws, wd, rho, temp, pres, rhum)
+    d, ws, wd, rho, temp, pres, rhum, tsun = _clip_same_len(d, ws, wd, rho, temp, pres, rhum, tsun)
 
     fig = make_subplots(
         rows=3, cols=2, shared_xaxes=True, vertical_spacing=0.08, horizontal_spacing=0.08,
-        subplot_titles=("Windspeed", "Wind direction", "Air density", "Air temperature", "Air pressure", "Relative humidity")
+        subplot_titles=("Windspeed", "Wind direction", "Air density", "Air temperature", "Air pressure", "Relative humidity"),
+        specs=[
+               [{"secondary_y": False},{"secondary_y": False}],
+               [{"secondary_y": False},{"secondary_y": True}],
+               [{"secondary_y": False},{"secondary_y": False}],
+        ]
     )
 
     fig.add_trace(go.Scatter(x=d, y=ws,  name="Wind [m/s]"), row=1, col=1)
@@ -5557,10 +6002,14 @@ def plot_environment(result):
     fig.add_trace(go.Scatter(x=d, y=pres,name="Pressure"),   row=3, col=1)
     fig.add_trace(go.Scatter(x=d, y=rhum,name="RH"),         row=3, col=2)
 
+    # second axis for tsun on temp plot
+    fig.add_trace(go.Scatter(x=d, y=tsun, name="Sun Exposure", line=dict(dash="dash")), row=2, col=2, secondary_y=True)
+    fig.update_yaxes(title_text="Sun Exp. [min/h]", row=2, col=2, secondary_y=True)
+
     fig.update_yaxes(title_text="m/s", row=1, col=1)
     fig.update_yaxes(title_text="°",   row=1, col=2)
     fig.update_yaxes(title_text="kg/m³", row=2, col=1)
-    fig.update_yaxes(title_text="°C",  row=2, col=2)
+    fig.update_yaxes(title_text="°C",  row=2, col=2, secondary_y=False)
     fig.update_yaxes(title_text="hPa", row=3, col=1)
     fig.update_yaxes(title_text="%",   row=3, col=2)
 
@@ -6344,7 +6793,7 @@ with st.sidebar:
         )
         
         st.session_state["high_speed_aero_threshold_kmh"] = st.number_input(
-            "Speed when using drops [km/h]",
+            "Aero Position Headwind Threshold [km/h]",
             min_value=0.0,
             max_value=120.0,
             value=35.0,
@@ -6949,13 +7398,13 @@ with col_u2:
                 rows.append({
                     "File": os.path.basename(path) if path else k,
                     "Date": date_str,
-                    "Distance [km]": float(r.get("total_distance_km", 0.0)),
-                    "Elev gain [m]": float(r.get("elevation_gain_m", 0.0)),
-                    "Duration [min]": float(r.get("total_duration_min", 0.0)),
-                    "Avg power [W]": float(r.get("avg_power_with_freewheeling", 0.0)),
-                    "Max VAM [m/h]": float(r.get("max_climb_vam_m_per_h", 0.0)),
-                    "Avg climb P [W]": float(r.get("avg_climb_power_w", 0.0)),
-                    "Best 5 km P [W]": float(r.get("best_segment_5km_power_w", 0.0)),
+                    "Duration [min]": time_to_readable(t_minutes=float(r.get("total_duration_min", 0.0))),
+                    "Distance [km]": np.round(float(r.get("total_distance_km", 0.0)), 1),
+                    "Elev gain [m]": np.round(float(r.get("elevation_gain_m", 0.0)), 0),
+                    "Avg power [W]": np.round(float(r.get("avg_power_with_freewheeling", 0.0)), 0),
+                    "Best 5 km P [W]": np.round(float(r.get("best_segment_5km_power_w", 0.0)), 0),
+                    "Max VAM [m/h]": np.round(float(r.get("max_climb_vam_m_per_h", 0.0)), 0),
+                    "Avg climb P [W]": np.round(float(r.get("avg_climb_power_w", 0.0)), 0),
                 })
             st.dataframe(pd.DataFrame(rows), hide_index=True)
 
@@ -6973,8 +7422,9 @@ if key and key in st.session_state["results"]:
 
     dist = float(result.get("total_distance_km", 0.0))
     elev = float(result.get("elevation_gain_m", 0.0))
-    total_dur = float(result.get("active_duration_min", 0.0))
-    active_dur = float(result.get("pedaling_duration_min", 0.0))
+    total_duration_min = float(result.get("total_duration_min", 0.0))
+    active_duration_min = float(result.get("active_duration_min", 0.0))
+    pedaling_duration_min = float(result.get("pedaling_duration_min", 0.0))
 
     kcal_cum = float(np.asarray(result.get("cum_kcal_active", [0]))[-1])
     kcal_base = float(np.asarray(result.get("cum_kcal_base", [0]))[-1])
@@ -6987,16 +7437,30 @@ if key and key in st.session_state["results"]:
         st.metric("Date", start_local.strftime("%Y-%m-%d") if start else "-")
         st.metric("Start", start_local.strftime("%H:%M:%S") if start else "-")
         st.metric("End", end_local.strftime("%H:%M:%S") if end else "-")
+        st.metric(f"Pause Time ({int(result.get('long_break_count',0)) + int(result.get('short_break_count',0))} pauses)", f"{time_to_readable(t_minutes=(total_duration_min - active_duration_min))}")
     with c2:
         st.metric("Distance", f"{dist:.1f} km")
-        st.metric("Duration (moving)", f"{time_to_readable(t_minutes=total_dur)}")
-        st.metric("Duration (pedaling)", f"{time_to_readable(t_minutes=active_dur)}")
+        st.metric("Duration (moving)", f"{time_to_readable(t_minutes=active_duration_min)}")
+        st.metric("Duration (pedaling)", f"{time_to_readable(t_minutes=pedaling_duration_min)}")
+        st.metric("Speed (avg/max)", f"{float(result.get('avg_speed_kph',0)):.1f} / {float(result.get('max_speed_kph',0)):.1f} km/h")
     with c3:
         st.metric("Elevation gain", f"{elev:.0f} m")
-        st.metric("Avg power (in motion)", f"{float(result.get('avg_power_with_freewheeling',0)):.0f} W")
-        st.metric("Avg power (pedaling)", f"{float(result.get('avg_power_active',0)):.0f} W")
+        if not result.get('avg_pow_meas_w',None) == None:
+            st.metric("Avg power (in motion) (calculated/measured)", f"{float(result.get('avg_power_with_freewheeling',0)):.0f} W / {float(result.get('avg_pow_meas_w',0)):.0f} W")
+        else:
+            st.metric("Avg power (in motion)", f"{float(result.get('avg_power_with_freewheeling',0)):.0f} W")
+        if not result.get('avg_pow_meas_w',None) == None:
+            st.metric("Avg power (pedaling) (calculated/measured)", f"{float(result.get('avg_power_active',0)):.0f} W / {float(result.get('avg_pow_meas_w_ped',0)):.0f} W")
+        else:
+            st.metric("Avg power (pedaling)", f"{float(result.get('avg_power_active',0)):.0f} W")
+        # st.metric("Avg power (pedaling)", f"{float(result.get('avg_power_active',0)):.0f} W")
         #st.metric("Avg power (total)", f"{float(result.get('avg_power',0)):.0f} W")
+        if not f"{float(result.get('norm_pwr_w_meas',0)):.0f}" == "nan":
+            st.metric("Normalized Power + VI (calc/meas)", f"{float(result.get('norm_pwr_w_calc',0)):.0f} ({float(result.get('var_ind_calc',0)):.2f}) / {float(result.get('norm_pwr_w_meas',0)):.0f}  ({float(result.get('var_ind_meas',0)):.2f}) W")
+        else:
+            st.metric("Normalized Power + VI", f"{float(result.get('norm_pwr_w_calc',0)):.0f} ({float(result.get('var_ind_calc',0)):.2f}) W")
     with c4:
+        st.metric("VAM (avg/max)", f"{float(result.get('avg_climb_vam_m_per_h',0)):.0f} / {float(result.get('max_climb_vam_m_per_h',0)):.0f} m/h")
         st.metric("Calories (activity)", f"{kcal_cum:.0f} kcal")
         st.metric("Calories (base)", f"{kcal_base:.0f} kcal")
         st.metric("Calories (total)", f"{kcal_total:.0f} kcal", help=fun_energy_tooltip(kcal_total))
@@ -7019,20 +7483,7 @@ if key and key in st.session_state["results"]:
 
     with col_r1:
         build_pdf = st.button("Build PDF report")
-        
-    with col_r2:
-        # download appears after build
-        pdf_bytes = st.session_state.get("latest_pdf_bytes", None)
-        if pdf_bytes:
-            ride_name = st.session_state.get("uploads_name", {}).get(key, key)
-            safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", ride_name)
-            st.download_button(
-                label="Download PDF report",
-                data=pdf_bytes,
-                file_name=f"GPX_Report_{safe_name}.pdf",
-                mime="application/pdf",
-            )
-
+    
     if build_pdf:
         with st.spinner("Creating PDF..."):
             ride_name = st.session_state.get("uploads_name", {}).get(key, key)
@@ -7054,6 +7505,19 @@ if key and key in st.session_state["results"]:
             st.session_state["latest_pdf_bytes"] = pdf_bytes
             st.success("PDF created. Use the download button above.")
 
+    
+    with col_r2:
+        # download appears after build
+        pdf_bytes = st.session_state.get("latest_pdf_bytes", None)
+        if pdf_bytes:
+            ride_name = st.session_state.get("uploads_name", {}).get(key, key)
+            safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", ride_name)
+            st.download_button(
+                label="Download PDF report",
+                data=pdf_bytes,
+                file_name=f"GPX_Report_{safe_name}.pdf",
+                mime="application/pdf",
+            )
 
 
     with tabs[0]:
