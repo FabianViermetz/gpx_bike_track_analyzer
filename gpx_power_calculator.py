@@ -1361,7 +1361,7 @@ def compute_power(speed, acc, grade, wind_speed, cfg: RiderBikeConfig, rho_air, 
 # --------------------------------------------------------------------
 # Global switch: which hydration model to use by default
 # --------------------------------------------------------------------
-HYDRATION_MODEL_MODE = "iso"   # "iso" or "sport"
+HYDRATION_MODEL_MODE = "sport"   # "iso" or "sport"
 
 # --------------------------------------------------------------------
 # Parameter sets (tweak as you like)
@@ -3349,7 +3349,7 @@ def _headwind_and_power(core, smooth, slope_type_series, weather, cfg, progress_
 
 
 
-        # 2) solve speed per point from power model)
+        # 2) solve speed per point from power model
         def _power_at_v(v_ms, i):
             p, *_ = compute_power(
                 v_ms,
@@ -6691,6 +6691,9 @@ def plot_mechanical(result):
     return fig
 
 
+def request_analyze():
+    st.session_state.do_analyze_now = True
+
 # =============================================================================
 # Streamlit App
 # =============================================================================
@@ -6710,10 +6713,6 @@ st.session_state.setdefault("uploads_name", {})    # key -> original name
 
 # New: "button edge" flag
 st.session_state.setdefault("do_analyze_now", False)
-
-def request_analyze():
-    st.session_state.do_analyze_now = True
-
 
 st.title("GPX Bike Tour Analyzer")
 
