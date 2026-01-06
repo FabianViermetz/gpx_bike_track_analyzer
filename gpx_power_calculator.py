@@ -1244,75 +1244,87 @@ def interp_with_gap_zero(new_t, t, dists, y, gap_s=10.0, fill_value=0.0):
 
     return yi
 
-def interp_with_gap_dist_fallback(new_t, t, dists, y, gap_s=10.0, fill_value=0.0,
-                                  clamp_nonneg=True):
-    """
-    Interpolate y(t) onto new_t.
+import numpy as np
 
-    If new_t falls inside a sampling gap in t larger than gap_s, replace output with
-    a distance-based average speed over that gap: (dists[i+1]-dists[i])/(t[i+1]-t[i]).
-
-    Parameters
-    ----------
-    new_t : array
-        Target timestamps (seconds).
-    t : array
-        Original timestamps (seconds).
-    dists : array
-        Cumulative distance at original timestamps (meters, or any distance unit).
-    y : array
-        Original y(t) values (e.g., speed).
-    gap_s : float
-        Gap threshold in seconds.
-    fill_value : float
-        Used if distance data is unusable for a gap (NaN, dt<=0, etc.).
-    clamp_nonneg : bool
-        If True, negative fallback speeds are clamped to 0 (useful for noisy dists).
-
-    Returns
-    -------
-    yi : array
-        Interpolated values with gap fallback applied.
-    """
+def interp_with_gap_dist_fallback(
+    new_t, t, dists, y,
+    gap_s=10.0,
+    fill_value=0.0,
+    clamp_nonneg=True,
+    fallback_only_if_y_invalid=True,
+    # tell the function what units y is in:
+    # "m/s"  -> v_gap uses meters/seconds
+    # "km/h" -> v_gap is converted to km/h
+    speed_unit="m/s",
+):
     t = np.asarray(t, dtype=float)
     y = np.asarray(y, dtype=float)
     dists = np.asarray(dists, dtype=float)
     new_t = np.asarray(new_t, dtype=float)
 
+    # Drop NaN times (they poison sorting/diffs)
+    good_t = np.isfinite(t)
+    t, y, dists = t[good_t], y[good_t], dists[good_t]
+
     # Sort by time
     order = np.argsort(t)
-    t = t[order]
-    y = y[order]
-    dists = dists[order]
+    t, y, dists = t[order], y[order], dists[order]
 
-    # Normal interpolation (np.interp clamps outside bounds to edge values)
+    # ---- Collapse duplicate timestamps (keep last sample) ----
+    # This avoids dt==0 segments and misaligned diffs.
+    if t.size >= 2:
+        uniq, idx_last = np.unique(t, return_index=False), None
+        # np.unique gives first indices by default; we want "last".
+        # So do it manually:
+        _, first_idx = np.unique(t[::-1], return_index=True)
+        keep = (t.size - 1 - first_idx)
+        keep.sort()
+        t, y, dists = t[keep], y[keep], dists[keep]
+
+    # Normal interpolation
     yi = np.interp(new_t, t, y)
 
     # Identify large gaps
     dt = np.diff(t)
-    gap_idx = np.where(dt > gap_s)[0]  # gap between t[i] and t[i+1]
+    gap_idx = np.where(dt > gap_s)[0]
     if gap_idx.size == 0:
         return yi
 
-    # Apply distance-based average speed inside each gap
+    # Conversion factor for v_gap
+    # (dists assumed meters; if yours is km, fix BEFORE calling or change this factor)
+    if speed_unit == "m/s":
+        conv = 1.0
+    elif speed_unit == "km/h":
+        conv = 3.6
+    else:
+        raise ValueError("speed_unit must be 'm/s' or 'km/h'")
+
     for i in gap_idx:
         t0, t1 = t[i], t[i + 1]
         mask = (new_t > t0) & (new_t < t1)
         if not np.any(mask):
             continue
 
+        # Decide whether to apply fallback at all
+        if fallback_only_if_y_invalid:
+            y0, y1 = y[i], y[i + 1]
+            # "valid" = finite and >0 (tweak if you want)
+            if np.isfinite(y0) and np.isfinite(y1) and (y0 > 0) and (y1 > 0):
+                continue  # keep yi (speed-based interpolation) for this gap
+
         d0, d1 = dists[i], dists[i + 1]
         denom = (t1 - t0)
 
-        # Validate
-        if denom <= 0 or not np.isfinite(d0) or not np.isfinite(d1):
+        if denom <= 0 or (not np.isfinite(d0)) or (not np.isfinite(d1)):
             v_gap = fill_value
         else:
-            v_gap = (d1 - d0) / denom
+            v_gap = (d1 - d0) / denom  # meters/second if dists is meters
             if not np.isfinite(v_gap):
                 v_gap = fill_value
-            elif clamp_nonneg and v_gap < 0:
-                v_gap = 0.0
+            else:
+                v_gap *= conv
+                if clamp_nonneg and v_gap < 0:
+                    v_gap = 0.0
 
         yi[mask] = v_gap
 
@@ -2386,7 +2398,7 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
                 pwr_raw.append(pwr_v)
                 temp_dev_raw.append(temp_v)
 
-                if prev_point:
+                if prev_point:# and (prev_point.latitude != point.latitude or prev_point.longitude != point.longitude):
                     dist = geodesic(
                         (prev_point.latitude, prev_point.longitude),
                         (point.latitude, point.longitude)
@@ -2491,12 +2503,29 @@ def _parse_and_interpolate_gpx(gpx_path, progress_cb=None):
         lats = np.interp(new_timestamps, timestamps, lats)
         lons = np.interp(new_timestamps, timestamps, lons)
         raw_alts = np.interp(new_timestamps, timestamps, raw_alts)
-        speeds = interp_with_gap_dist_fallback(new_timestamps, timestamps, dists, speeds, gap_s=10.0, fill_value=0.0)
-        dspeed = np.diff(speeds)
-        bearings_degs = np.interp(new_timestamps, timestamps, bearings_degs)
-        for i in range(2,len(speeds)-2):
-            if np.abs(dspeed[i]) > 5 and np.abs(dspeed[i+1]) > 5:
-                speeds[i] = (speeds[i] + speeds[i-2])/2.
+        # speeds = interp_with_gap_dist_fallback(new_timestamps, timestamps, dists, speeds, gap_s=10.0, fill_value=0.0)
+        speeds = np.interp(new_timestamps, timestamps, speeds)
+        # dspeed = np.diff(speeds)
+        # for i in range(2, len(speeds) - 2):
+        #     if np.abs(dspeed[i]) > 5 and np.abs(dspeed[i + 1]) > 5:
+        #         speeds[i] = (speeds[i] + speeds[i - 2]) / 2.0
+        #recalculate bearings from new lats/lons
+        bearings_degs = []
+        for i in range(len(new_timestamps)):
+            if i == 0:
+                bearings_degs.append(0.0)
+            else:
+                bearing_deg = compute_bearing(lats[i-1], lons[i-1], lats[i], lons[i])
+                bearings_degs.append(bearing_deg)
+        #replace spikes in speed with average of neighbors based on sanity of bearings
+        for i in range(1, len(speeds) - 1):
+            if bearings_degs[i] == 0.0:
+                speeds[i] = (speeds[i - 1] + speeds[i + 1]) / 2.0
+        #replace exact zeros in bearings with previous value to avoid jumps
+        for i in range(1, len(bearings_degs)):
+            if bearings_degs[i] == 0.0:
+                bearings_degs[i] = bearings_degs[i-1]
+        bearings_degs = np.array(bearings_degs)
 
         def _interp_sensor(raw_list):
             arr = np.asarray(raw_list, dtype=float)
@@ -2739,7 +2768,7 @@ def _parse_and_interpolate_tcx(tcx_path, progress_cb=None):
         temp_dev_raw.append(temp_v)
 
         # metrics between points
-        if prev_lat is not None and prev_lon is not None and prev_time is not None:
+        if prev_lat is not None and prev_lon is not None and prev_time is not None:# and (prev_lat != lat or prev_lon != lon):
             dist_m = geodesic((prev_lat, prev_lon), (lat, lon)).meters
             bearing_deg = compute_bearing(prev_lat, prev_lon, lat, lon)
 
@@ -2837,10 +2866,23 @@ def _parse_and_interpolate_tcx(tcx_path, progress_cb=None):
         raw_alts = np.interp(new_timestamps, timestamps, raw_alts)
         speeds = np.interp(new_timestamps, timestamps, speeds)
         dspeed = np.diff(speeds)
-        bearings_degs = np.interp(new_timestamps, timestamps, bearings_degs)
+        
         for i in range(2, len(speeds) - 2):
             if np.abs(dspeed[i]) > 5 and np.abs(dspeed[i + 1]) > 5:
                 speeds[i] = (speeds[i] + speeds[i - 2]) / 2.0
+        #recalculate bearings from new lats/lons
+        bearings_degs = []
+        for i in range(len(new_timestamps)):
+            if i == 0:
+                bearings_degs.append(0.0)
+            else:
+                bearing_deg = compute_bearing(lats[i-1], lons[i-1], lats[i], lons[i])
+                bearings_degs.append(bearing_deg)
+        #replace exact zeros in bearings with previous value to avoid jumps
+        for i in range(1, len(bearings_degs)):
+            if bearings_degs[i] == 0.0:
+                bearings_degs[i] = bearings_degs[i-1]
+        bearings_degs = np.array(bearings_degs)
 
         def _interp_sensor(raw_list):
             arr = np.asarray(raw_list, dtype=float)
@@ -3044,7 +3086,7 @@ def _parse_and_interpolate_fit(fit_path, progress_cb=None):
         dist_cum_m.append(dc if dc is not None else np.nan)
 
         # --- compute incremental distance + bearing + speed ---
-        if prev_lat is not None and prev_lon is not None and prev_time is not None:
+        if prev_lat is not None and prev_lon is not None and prev_time is not None:# and (prev_lat != lat or prev_lon != lon):
             # time diff
             time_diff = (times[-1] - prev_time).total_seconds()
             if time_diff <= 0:
@@ -3143,11 +3185,23 @@ def _parse_and_interpolate_fit(fit_path, progress_cb=None):
         raw_alts = np.interp(new_timestamps, timestamps, raw_alts)
         speeds = np.interp(new_timestamps, timestamps, speeds)
         dspeed = np.diff(speeds)
-        bearings_degs = np.interp(new_timestamps, timestamps, bearings_degs)
         for i in range(2, len(speeds) - 2):
             if np.abs(dspeed[i]) > 5 and np.abs(dspeed[i + 1]) > 5:
                 speeds[i] = (speeds[i] + speeds[i - 2]) / 2.0
-
+        #recalculate bearings from new lats/lons
+        bearings_degs = []
+        for i in range(len(new_timestamps)):
+            if i == 0:
+                bearings_degs.append(0.0)
+            else:
+                bearing_deg = compute_bearing(lats[i-1], lons[i-1], lats[i], lons[i])
+                bearings_degs.append(bearing_deg)
+        #replace exact zeros in bearings with previous value to avoid jumps
+        for i in range(1, len(bearings_degs)):
+            if bearings_degs[i] == 0.0:
+                bearings_degs[i] = bearings_degs[i-1]
+        bearings_degs = np.array(bearings_degs)
+        
         def _interp_sensor(raw_list):
             arr = np.asarray(raw_list, dtype=float)
             mask = np.isfinite(arr)
@@ -3349,7 +3403,7 @@ def _headwind_and_power(core, smooth, slope_type_series, weather, cfg, progress_
 
 
 
-        # 2) solve speed per point from power model
+        # 2) solve speed per point from power model)
         def _power_at_v(v_ms, i):
             p, *_ = compute_power(
                 v_ms,
@@ -3628,6 +3682,20 @@ def _filter_and_disk_temp(core, smooth, slope_type_series, corner_type_series, p
     grades_array = np.array(moving_average(grades, window_size=SMOOTHING_WINDOW_SIZE_ALT_S))
     total_distance_km = total_dists[idx][-1] if np.any(idx) else 0.0
     elevation_gain_m = float(np.sum(np.clip(np.diff(smoothed_alts[idx]), 0, None))) if len(smoothed_alts[idx]) > 1 else 0.0
+    # create bearing_diffs_degs
+    # wrap to [-180, 180]
+    # calculate angle between 3 points:
+    bearing_diffs_degs = np.zeros_like(core["bearings_degs"])
+    for i in range(1, len(core["bearings_degs"])-1):
+        prev_bearing = core["bearings_degs"][i-1]
+        curr_bearing = core["bearings_degs"][i]
+        next_bearing = core["bearings_degs"][i+1]
+
+        diff1 = _wrap_deg180(curr_bearing - prev_bearing)
+        diff2 = _wrap_deg180(next_bearing - curr_bearing)
+
+        bearing_diffs_degs[i] = np.abs(_wrap_deg180(diff2 - diff1))**0.5
+    
     return {
         "valid": idx,
         "total_dists": total_dists,
@@ -3666,7 +3734,8 @@ def _filter_and_disk_temp(core, smooth, slope_type_series, corner_type_series, p
         "elevation_gain_m": elevation_gain_m,
         "filtered_slope_type": slope_type_series[idx],
         "filtered_corner_type": corner_type_series[idx],
-        "filtered_bearings_degs": core["bearings_degs"][idx]
+        "filtered_bearings_degs": core["bearings_degs"][idx],
+        "filtered_bearing_diffs_degs": bearing_diffs_degs[idx],
     }
 
 
@@ -4511,6 +4580,8 @@ def _gear_simulation(filtered, filtered_sensors, cfg, target_cadence, exclude_do
     else:
         #make array from single target cadence value
         target_cadence = np.full(len(filtered_speeds_kph), target_cadence, dtype=float)
+        HYSTERESIS_REAR_RPM = cfg.globals.get("HYSTERESIS_REAR_RPM", 1)
+        MIN_SHIFT_INTERVAL_REAR_SEC = cfg.globals.get("MIN_SHIFT_INTERVAL_REAR_SEC", 1)
 
 
     current_front = cfg.front_der_teeth[-1]
@@ -6254,16 +6325,106 @@ def plot_climb_stat_grouped(result, top_n=None, mode="climb"):
 # =============================================================================
 # Map builder (Folium)
 # =============================================================================
+
+def distance_based_subsample_idx(
+    d_km: np.ndarray,
+    max_points: int,
+    min_spacing_m: float | None = None,
+) -> np.ndarray:
+    """
+    Return indices that keep roughly uniform *distance* spacing.
+    Always includes first and last valid index.
+
+    Parameters
+    ----------
+    d_km : array
+        Cumulative distance in km (should be non-decreasing-ish).
+    max_points : int
+        Upper cap for points (performance limit).
+    min_spacing_m : float | None
+        Optional explicit spacing in meters. If None, spacing is chosen
+        from total distance / (max_points-1).
+
+    Notes
+    -----
+    - Handles NaNs by ignoring them.
+    - If distance has small non-monotonic glitches, we use running-max to
+      prevent "going backwards" from breaking the search.
+    """
+    d_km = np.asarray(d_km, dtype=float)
+    n = d_km.size
+    if n == 0:
+        return np.array([], dtype=int)
+
+    if max_points is None or max_points <= 0:
+        return np.arange(n, dtype=int)
+
+    valid = np.isfinite(d_km)
+    if not np.any(valid):
+        # nothing valid -> at least keep endpoints if possible
+        return np.array([0, n - 1], dtype=int) if n >= 2 else np.array([0], dtype=int)
+
+    # Work on valid indices only
+    i_valid = np.flatnonzero(valid)
+    d = d_km[i_valid]
+
+    # Make non-decreasing to avoid issues with tiny GPS distance glitches
+    d = np.maximum.accumulate(d)
+
+    if d.size <= max_points:
+        return i_valid  # already under cap
+
+    total_km = float(d[-1] - d[0])
+    if total_km <= 0.0:
+        # degenerate distance -> fallback to uniform index spacing
+        return np.linspace(i_valid[0], i_valid[-1], max_points, dtype=int)
+
+    # Choose spacing
+    if min_spacing_m is None or min_spacing_m <= 0:
+        spacing_km = total_km / float(max_points - 1)
+    else:
+        spacing_km = float(min_spacing_m) / 1000.0
+
+    # Target distances in km
+    targets = d[0] + spacing_km * np.arange(max_points, dtype=float)
+    targets[-1] = d[-1]  # ensure end is included exactly
+
+    # For each target distance, pick the first index where d >= target
+    pick_local = np.searchsorted(d, targets, side="left")
+    pick_local = np.clip(pick_local, 0, d.size - 1)
+    picked = i_valid[pick_local]
+
+    # Deduplicate and force endpoints
+    picked = np.unique(picked)
+    if picked.size == 0:
+        picked = np.array([i_valid[0], i_valid[-1]], dtype=int)
+
+    if picked[0] != i_valid[0]:
+        picked = np.insert(picked, 0, i_valid[0])
+    if picked[-1] != i_valid[-1]:
+        picked = np.append(picked, i_valid[-1])
+
+    # If de-dup reduced a lot (e.g., constant distance regions), we keep as-is.
+    # That’s usually good: no extra geometry exists there anyway.
+    return picked
+
+
+# =============================================================================
+# build_map
+# =============================================================================
 def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: float):
     lats_full = np.asarray(result["filtered_lats"], dtype=float)
     lons_full = np.asarray(result["filtered_lons"], dtype=float)
-    d_full = np.asarray(result["filtered_dists"], dtype=float)
+    d_full = np.asarray(result["filtered_dists"], dtype=float)          # expected km (based on your code)
     timestamps = np.asarray(result["filtered_times"])
     total_break_duration = result["long_break_total_min"] + result["short_break_total_min"]
+
     if lats_full.size == 0 or lons_full.size == 0:
         return None, None, None
 
+    # --------------------------
     # metric selection
+    # --------------------------
     if mode == "Speed [km/h]":
         values_full = np.asarray(result["filtered_speeds_kph"], dtype=float)
         caption = "Speed [km/h]"
@@ -6286,9 +6447,11 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
         values_full = np.asarray(result["filtered_grades"], dtype=float)
         caption = "Grade [%]"
     elif mode.startswith("Cornering"):
-        # For the generic colorbar-based mode you'd use bearings,
+        # For generic colorbar-based mode you'd use bearings,
         # but for "climb-like" coloring we will use filtered_corner_type below.
-        values_full = np.asarray(result.get("filtered_bearings_degs", result["filtered_speeds_kph"]), dtype=float)
+        values_full = np.asarray(np.abs(result["filtered_bearing_diffs_degs"]), dtype=float)
+
+        # values_full = np.asarray(result["filtered_bearings_degs"], dtype=float)
         caption = "Bearing [°]"
     elif mode == "None (single color)":
         values_full = None
@@ -6297,20 +6460,27 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
         values_full = np.asarray(result["filtered_speeds_kph"], dtype=float)
         caption = "Speed [km/h]"
 
+    # --------------------------
     # segment-mean mode (same-length)
-    if SEGMENT_MEAN_MODE and values_full is not None and d_full.size > 1 and marker_spacing_km > 0:
+    # --------------------------
+    # Keep your existing globals/functions; this block remains unchanged.
+    if "SEGMENT_MEAN_MODE" in globals() and SEGMENT_MEAN_MODE and values_full is not None and d_full.size > 1 and marker_spacing_km > 0:
+        # expects: segment_mean_by_distance(d_km, y, marker_spacing_km)
         values_full = segment_mean_by_distance(d_full, values_full, float(marker_spacing_km))
 
-    # subsample for performance (drawing only)
-    n = len(lats_full)
-    idx = np.linspace(0, n - 1, MAX_MAP_POINTS, dtype=int) if n > MAX_MAP_POINTS else np.arange(n, dtype=int)
+    # --------------------------
+    # subsample for performance (drawing only) — DISTANCE-based
+    # --------------------------
+    # expects: MAX_MAP_POINTS global, else fallback
+    max_pts = globals().get("MAX_MAP_POINTS", 2000)
+    idx = distance_based_subsample_idx(d_full, int(max_pts))
 
     lats = lats_full[idx]
     lons = lons_full[idx]
     vals = np.asarray(values_full, dtype=float)[idx] if values_full is not None else None
 
-    center_lat = float(np.mean(lats_full))
-    center_lon = float(np.mean(lons_full))
+    center_lat = float(np.nanmean(lats_full))
+    center_lon = float(np.nanmean(lons_full))
     m = folium.Map(location=[center_lat, center_lon], zoom_start=13, tiles="OpenStreetMap")
 
     positions = list(zip(lats.tolist(), lons.tolist()))
@@ -6346,7 +6516,6 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
     has_corner = (corner_type_full is not None) and (len(corner_type_full) == len(d_full))
 
     if has_corner:
-        # Adjust to your exact labels. Unknown labels -> 0 (straight).
         sev_map = {
             "level": 0,
             "none": 0,
@@ -6375,60 +6544,76 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
             color = "red" if in_climb else ("green" if in_down else "blue")
             folium.PolyLine([positions[i], positions[i + 1]], color=color, weight=4, opacity=0.9).add_to(m)
 
-    elif mode.startswith("Cornering") and (sev is not None):
-        # severity colors: easy to distinguish on map
-        col_by_sev = {
-            0: "blue",       # straight
-            1: "#f1c40f",    # gentle (yellow)
-            2: "#e67e22",    # medium (orange)
-            3: "#8e44ad",    # tight (purple)
-        }
-        for i in range(len(positions) - 1):
-            s = int(max(sev[i], sev[i + 1]))  # color segment if either endpoint is cornering
-            color = col_by_sev.get(s, "blue")
-            folium.PolyLine([positions[i], positions[i + 1]], color=color, weight=4, opacity=0.9).add_to(m)
+    # elif mode.startswith("Cornering") and (sev is not None):
+    #     col_by_sev = {
+    #         0: "blue",       # straight
+    #         1: "#f1c40f",    # gentle (yellow)
+    #         2: "#e67e22",    # medium (orange)
+    #         3: "#8e44ad",    # tight (purple)
+    #     }
+    #     for i in range(len(positions) - 1):
+    #         s = int(max(sev[i], sev[i + 1]))  # color segment if either endpoint is cornering
+    #         color = col_by_sev.get(s, "blue")
+    #         folium.PolyLine([positions[i], positions[i + 1]], color=color, weight=4, opacity=0.9).add_to(m)
 
     else:
         # continuous colormap mode
-        if vals is None or vals.size < 2 or np.nanmin(vals) == np.nanmax(vals):
+        if vals is None or vals.size < 2 or (np.nanmin(vals) == np.nanmax(vals)):
             folium.PolyLine(positions, color="blue", weight=3, opacity=0.9).add_to(m)
         else:
             vmin = float(np.nanmin(vals))
             vmax = float(np.nanmax(vals))
 
             colormap = cmap.linear.viridis.scale(vmin, vmax)
-
             if caption:
                 colormap.caption = caption
             colormap.add_to(m)
+
             val_list = vals.tolist()
             for i in range(len(positions) - 1):
                 folium.PolyLine(
                     [positions[i], positions[i + 1]],
                     color=colormap(val_list[i]),
                     weight=4,
-                    opacity=0.9
+                    opacity=0.9,
                 ).add_to(m)
 
+    # --------------------------
     # Start/end markers
+    # --------------------------
     full_positions = list(zip(lats_full.tolist(), lons_full.tolist()))
     folium.Marker(full_positions[0], popup="Start").add_to(m)
+
+    # Duration strings (timestamps assumed datetime-like)
+    try:
+        total_duration_s = timestamps[-1].timestamp() - timestamps[0].timestamp()
+        ride_duration_min = (timestamps[-1].timestamp() / 60.0 - timestamps[0].timestamp() / 60.0) - total_break_duration
+    except Exception:
+        total_duration_s = 0.0
+        ride_duration_min = 0.0
+
     folium.Marker(
         full_positions[-1],
         popup=(
             f"End<br>"
-            f"Total\u00A0Duration:\u00A0{time_to_readable(t_seconds=timestamps[-1].timestamp() - timestamps[0].timestamp())}<br>"
-            f"Ride\u00A0Duration:\u00A0{time_to_readable(t_minutes=(timestamps[-1].timestamp()/60. - timestamps[0].timestamp()/60.)-total_break_duration)}<br>"
+            f"Total\u00A0Duration:\u00A0{time_to_readable(t_seconds=total_duration_s)}<br>"
+            f"Ride\u00A0Duration:\u00A0{time_to_readable(t_minutes=ride_duration_min)}<br>"
             f"Break\u00A0Duration:\u00A0{time_to_readable(t_minutes=total_break_duration)}<br>"
-        )
+        ),
     ).add_to(m)
 
-    # Distance markers
+    # --------------------------
+    # Distance markers (use full arrays so markers are exact)
+    # --------------------------
     if marker_spacing_km > 0 and d_full.size > 0:
         next_mark = float(marker_spacing_km)
         for i, (d_km, lat, lon) in enumerate(zip(d_full, lats_full, lons_full)):
             if d_km + 1e-9 >= next_mark:
-                t_minutes = timestamps[i].timestamp()/60. - timestamps[0].timestamp()/60.
+                try:
+                    t_minutes = timestamps[i].timestamp() / 60.0 - timestamps[0].timestamp() / 60.0
+                except Exception:
+                    t_minutes = float("nan")
+
                 folium.CircleMarker(
                     location=[float(lat), float(lon)],
                     radius=3,
@@ -6438,26 +6623,32 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
                     popup=(
                         f"Distance:\u00A0{next_mark:.1f}\u00A0km<br>"
                         f"Time:\u00A0{time_to_readable(t_minutes=t_minutes)}"
-                    )
+                    ),
                 ).add_to(m)
                 next_mark += float(marker_spacing_km)
 
+    # --------------------------
     # combine break markers close to each other (time + distance)
+    # --------------------------
     combined_breaks = []
     breaks = result.get("breaks", [])
     if breaks:
+        # expects COMBINE_BREAK_MAX_TIME_DIFF, COMBINE_BREAK_MAX_DISTANCE globals
+        max_dt = globals().get("COMBINE_BREAK_MAX_TIME_DIFF", 2.0)
+        max_dist = globals().get("COMBINE_BREAK_MAX_DISTANCE", 40.0)
+
         breaks_sorted = sorted(breaks, key=lambda b: b["time_min"])
         current = breaks_sorted[0].copy()
-        current["break_count"] = 1  # number of merged breaks
+        current["break_count"] = 1
 
         for b in breaks_sorted[1:]:
             dt_min = b["time_min"] - (current["time_min"] + current["duration_min"])
             try:
                 dist_m = geodesic((current["lat"], current["lon"]), (b["lat"], b["lon"])).meters
-            except ValueError:
-                dist_m = COMBINE_BREAK_MAX_DISTANCE + 1.0
+            except Exception:
+                dist_m = max_dist + 1.0
 
-            if dt_min <= COMBINE_BREAK_MAX_TIME_DIFF and dist_m <= COMBINE_BREAK_MAX_DISTANCE:
+            if dt_min <= max_dt and dist_m <= max_dist:
                 n_ = current["break_count"]
                 current["duration_min"] += b["duration_min"]
                 current["distance_km"] = (current["distance_km"] * n_ + b["distance_km"]) / (n_ + 1)
@@ -6472,10 +6663,10 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
                 current["break_count"] = 1
 
         combined_breaks.append(current)
-    else:
-        combined_breaks = []
 
+    # --------------------------
     # Markers for breaks
+    # --------------------------
     for b in combined_breaks:
         lat_b = b["lat"]
         lon_b = b["lon"]
@@ -6506,11 +6697,10 @@ def build_map(result, mode: str, marker_spacing_km: float, long_break_thr_min: f
                 f"Duration:\u00A0{time_to_readable(t_minutes=dur)}<br>"
                 f"Distance:\u00A0{bdist:.2f}\u00A0km<br>"
                 f"{f'Combined\u00A0Breaks:\u00A0{bcount}' if bcount > 1 else ''}"
-            )
+            ),
         ).add_to(m)
 
     return m, values_full, caption
-
 def plot_cmap_metric(result, y_label, values_full, cursor_idx=None, spacing_km=5.0, segment_mean_mode=True):
     d = _arr(result.get("filtered_dists"))
     if values_full is None or d is None or len(d) == 0:
